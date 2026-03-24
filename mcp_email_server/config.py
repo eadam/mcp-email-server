@@ -236,6 +236,7 @@ class Settings(BaseSettings):
     db_location: str = CONFIG_PATH.with_name("db.sqlite3").as_posix()
     enable_attachment_download: bool = False
     allowed_recipients: list[str] = []
+    allowed_senders: list[str] = []
 
     model_config = SettingsConfigDict(toml_file=CONFIG_PATH, validate_assignment=True, revalidate_instances="always")
 
@@ -262,6 +263,16 @@ class Settings(BaseSettings):
             self.allowed_recipients = list(
                 dict.fromkeys(addr.strip().lower() for addr in env_allowed.split(",") if addr.strip())
             )
+
+        # Normalise allowed_senders from TOML: lowercase and deduplicate (globs preserved)
+        if self.allowed_senders:
+            self.allowed_senders = list(dict.fromkeys(p.strip().lower() for p in self.allowed_senders if p.strip()))
+
+        # Parse allowed_senders from environment variable (comma-separated)
+        # Env var takes precedence over TOML-configured value
+        env_senders = os.getenv("MCP_EMAIL_SERVER_ALLOWED_SENDERS")
+        if env_senders:
+            self.allowed_senders = list(dict.fromkeys(p.strip().lower() for p in env_senders.split(",") if p.strip()))
 
         # Check for email configuration from environment variables
         env_email = EmailSettings.from_env()
