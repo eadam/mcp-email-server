@@ -20,8 +20,25 @@ from mcp_email_server.emails.models import (
     EmailMetadataPageResponse,
     MailboxInfo,
 )
+from mcp_email_server.log import logger
 
 mcp = FastMCP("email")
+
+
+def _normalize_addrs(raw: list[str]) -> list[str]:
+    """Extract bare lower-cased email addresses from a list of recipient strings.
+
+    Strips display-name forms like 'Foo <bad@evil.example>' down to the angle-addr
+    component before allowlist comparison. Closes the display-name bypass where a
+    well-formed allowlist entry could be evaded by wrapping the real address in
+    a friendly display name.
+    """
+    normalized: list[str] = []
+    for name_addr in email_utils.getaddresses(raw):
+        addr = name_addr[1].strip().lower() if name_addr[1] else ""
+        if addr:
+            normalized.append(addr)
+    return normalized
 
 
 def _sender_allowed(sender: str, patterns: list[str]) -> bool:
@@ -115,7 +132,15 @@ async def list_emails_metadata(
     ] = None,
 ) -> EmailMetadataPageResponse:
     # Read settings before the IMAP call to skip the round-trip when allowlist is empty
-    allowed = get_settings().allowed_senders
+    settings = get_settings()
+    allowed = settings.allowed_senders
+    # homelab hardening: fail-closed if required mode is on and no sender allowlist set
+    if settings.allowlist_required and not allowed:
+        logger.warning("allowlist_block kind=sender_read reason=required-mode-empty-allowlist")
+        raise ValueError(
+            "Sender allowlist is required (MCP_EMAIL_SERVER_ALLOWLIST_REQUIRED=true) "
+            "but allowed_senders is empty. Configure MCP_EMAIL_SERVER_ALLOWED_SENDERS."
+        )
     handler = dispatch_handler(account_name)
 
     result = await handler.get_emails_metadata(
@@ -133,7 +158,13 @@ async def list_emails_metadata(
         answered=answered,
     )
     if allowed:
-        result.emails = [e for e in result.emails if _sender_allowed(e.sender, allowed)]
+        kept: list = []
+        for e in result.emails:
+            if _sender_allowed(e.sender, allowed):
+                kept.append(e)
+            else:
+                logger.warning("allowlist_block kind=sender_read addr=%r", e.sender)
+        result.emails = kept
     # Note: result.total reflects the IMAP server-side count and is intentionally not adjusted.
     # See "Known limitation" in the README's "Filtering Incoming Email (Sender Allowlist)" section.
     return result
@@ -153,13 +184,27 @@ async def get_emails_content(
     mailbox: Annotated[str, Field(default="INBOX", description="The mailbox to retrieve emails from.")] = "INBOX",
 ) -> EmailContentBatchResponse:
     # Read settings before the IMAP call to skip the round-trip when allowlist is empty
-    allowed = get_settings().allowed_senders
+    settings = get_settings()
+    allowed = settings.allowed_senders
+    # homelab hardening: fail-closed if required mode is on and no sender allowlist set
+    if settings.allowlist_required and not allowed:
+        logger.warning("allowlist_block kind=sender_read reason=required-mode-empty-allowlist")
+        raise ValueError(
+            "Sender allowlist is required (MCP_EMAIL_SERVER_ALLOWLIST_REQUIRED=true) "
+            "but allowed_senders is empty. Configure MCP_EMAIL_SERVER_ALLOWED_SENDERS."
+        )
     handler = dispatch_handler(account_name)
     result = await handler.get_emails_content(email_ids, mailbox)
     if allowed:
-        result.emails = [e for e in result.emails if _sender_allowed(e.sender, allowed)]
+        kept: list = []
+        for e in result.emails:
+            if _sender_allowed(e.sender, allowed):
+                kept.append(e)
+            else:
+                logger.warning("allowlist_block kind=sender_read addr=%r", e.sender)
+        result.emails = kept
         result.retrieved_count = len(result.emails)
-        # Blocked emails are silently dropped — NOT added to failed_ids.
+        # Blocked emails are silently dropped from the response — NOT added to failed_ids.
         # Adding them would reveal their existence to the AI.
         # requested_count is intentionally left at the caller-supplied value: the AI
         # already knows what IDs it requested, so leaving it unchanged leaks nothing.
@@ -225,10 +270,20 @@ async def send_email(
     ] = None,
 ) -> str:
     settings = get_settings()
+    # homelab hardening: fail-closed if required mode is on and no recipient allowlist set
+    if settings.allowlist_required and not settings.allowed_recipients:
+        logger.warning("allowlist_block kind=recipient_send addr=%r reason=required-mode-empty-allowlist", recipients)
+        raise ValueError(
+            "Recipient allowlist is required (MCP_EMAIL_SERVER_ALLOWLIST_REQUIRED=true) "
+            "but allowed_recipients is empty. Configure MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS."
+        )
     if settings.allowed_recipients:
-        all_recipients = recipients + (cc or []) + (bcc or [])
-        blocked = [r for r in all_recipients if r.lower() not in settings.allowed_recipients]
+        # homelab hardening: normalize 'Foo <bad@evil>' down to 'bad@evil' before compare
+        all_addrs = _normalize_addrs(recipients + (cc or []) + (bcc or []))
+        blocked = [r for r in all_addrs if r not in settings.allowed_recipients]
         if blocked:
+            for addr in blocked:
+                logger.warning("allowlist_block kind=recipient_send addr=%r", addr)
             raise ValueError(
                 f"Recipient(s) not in allowlist: {', '.join(blocked)}. "
                 f"Allowed: {', '.join(settings.allowed_recipients)}"

@@ -237,6 +237,11 @@ class Settings(BaseSettings):
     enable_attachment_download: bool = False
     allowed_recipients: list[str] = []
     allowed_senders: list[str] = []
+    # homelab hardening: when True, an empty allowlist means "deny all" (fail-closed)
+    # rather than "allow all" (the upstream default). Send and read tools both honor this.
+    # save_to_mailbox is intentionally NOT subject to allowlists in any mode (drafts are
+    # the human-review gate). Default False preserves upstream-compatible behavior.
+    allowlist_required: bool = False
 
     model_config = SettingsConfigDict(
         toml_file=CONFIG_PATH, validate_assignment=True, revalidate_instances="always", extra="ignore"
@@ -275,6 +280,12 @@ class Settings(BaseSettings):
         env_senders = os.getenv("MCP_EMAIL_SERVER_ALLOWED_SENDERS")
         if env_senders:
             self.allowed_senders = list(dict.fromkeys(p.strip().lower() for p in env_senders.split(",") if p.strip()))
+
+        # homelab hardening: opt-in fail-closed mode for allowlists
+        env_required = os.getenv("MCP_EMAIL_SERVER_ALLOWLIST_REQUIRED")
+        if env_required is not None:
+            self.allowlist_required = _parse_bool_env(env_required, False)
+            logger.info(f"Set allowlist_required={self.allowlist_required} from environment variable")
 
         # Check for email configuration from environment variables
         env_email = EmailSettings.from_env()
