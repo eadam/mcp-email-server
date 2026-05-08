@@ -430,6 +430,40 @@ async def move_emails(
 
 
 @mcp.tool(
+    description=(
+        "Archive one or more emails by moving them to the Archive folder. "
+        "Convenience wrapper around move_emails — saves the LLM having to know "
+        "the destination folder name. Default destination is 'Archive'; override "
+        "for providers that use a different folder name."
+    )
+)
+async def archive_emails(
+    account_name: Annotated[str, Field(description="The name of the email account.")],
+    email_ids: Annotated[
+        list[str],
+        Field(description="List of email_id to archive (obtained from list_emails_metadata)."),
+    ],
+    source_mailbox: Annotated[
+        str, Field(default="INBOX", description="The source mailbox containing the emails.")
+    ] = "INBOX",
+    archive_mailbox: Annotated[
+        str,
+        Field(
+            default="Archive",
+            description="The archive folder name. Defaults to 'Archive'. Some providers use 'All Mail', '[Gmail]/All Mail', or 'INBOX.Archive'.",
+        ),
+    ] = "Archive",
+) -> str:
+    handler = dispatch_handler(account_name)
+    moved_ids, failed_ids = await handler.move_emails(email_ids, source_mailbox, archive_mailbox)
+
+    result = f"Successfully archived {len(moved_ids)} email(s) to {archive_mailbox}"
+    if failed_ids:
+        result += f", failed to archive {len(failed_ids)} email(s): {', '.join(failed_ids)}"
+    return result
+
+
+@mcp.tool(
     description="List available mailboxes/folders for an email account. Returns folder names, hierarchy delimiters, and flags. Useful for discovering folder names before moving emails."
 )
 async def list_mailboxes(
