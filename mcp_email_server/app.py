@@ -135,7 +135,7 @@ async def list_emails_metadata(
     settings = get_settings()
     allowed = settings.allowed_senders
     # homelab hardening: fail-closed if required mode is on and no sender allowlist set
-    if settings.allowlist_required and not allowed:
+    if getattr(settings, "allowlist_required", False) is True and not allowed:
         logger.warning("allowlist_block kind=sender_read reason=required-mode-empty-allowlist")
         raise ValueError(
             "Sender allowlist is required (MCP_EMAIL_SERVER_ALLOWLIST_REQUIRED=true) "
@@ -163,7 +163,7 @@ async def list_emails_metadata(
             if _sender_allowed(e.sender, allowed):
                 kept.append(e)
             else:
-                logger.warning("allowlist_block kind=sender_read addr=%r", e.sender)
+                logger.warning(f"allowlist_block kind=sender_read addr={e.sender!r}")
         result.emails = kept
     # Note: result.total reflects the IMAP server-side count and is intentionally not adjusted.
     # See "Known limitation" in the README's "Filtering Incoming Email (Sender Allowlist)" section.
@@ -187,7 +187,7 @@ async def get_emails_content(
     settings = get_settings()
     allowed = settings.allowed_senders
     # homelab hardening: fail-closed if required mode is on and no sender allowlist set
-    if settings.allowlist_required and not allowed:
+    if getattr(settings, "allowlist_required", False) is True and not allowed:
         logger.warning("allowlist_block kind=sender_read reason=required-mode-empty-allowlist")
         raise ValueError(
             "Sender allowlist is required (MCP_EMAIL_SERVER_ALLOWLIST_REQUIRED=true) "
@@ -201,7 +201,7 @@ async def get_emails_content(
             if _sender_allowed(e.sender, allowed):
                 kept.append(e)
             else:
-                logger.warning("allowlist_block kind=sender_read addr=%r", e.sender)
+                logger.warning(f"allowlist_block kind=sender_read addr={e.sender!r}")
         result.emails = kept
         result.retrieved_count = len(result.emails)
         # Blocked emails are silently dropped from the response — NOT added to failed_ids.
@@ -270,9 +270,11 @@ async def send_email(
     ] = None,
 ) -> str:
     settings = get_settings()
-    # homelab hardening: fail-closed if required mode is on and no recipient allowlist set
-    if settings.allowlist_required and not settings.allowed_recipients:
-        logger.warning("allowlist_block kind=recipient_send addr=%r reason=required-mode-empty-allowlist", recipients)
+    # homelab hardening: fail-closed if required mode is on and no recipient allowlist set.
+    # `is True` (not truthy check) so MagicMock attributes in unit tests don't accidentally
+    # trip this branch — only a real True opts in.
+    if getattr(settings, "allowlist_required", False) is True and not settings.allowed_recipients:
+        logger.warning(f"allowlist_block kind=recipient_send addrs={recipients!r} reason=required-mode-empty-allowlist")
         raise ValueError(
             "Recipient allowlist is required (MCP_EMAIL_SERVER_ALLOWLIST_REQUIRED=true) "
             "but allowed_recipients is empty. Configure MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS."
@@ -283,7 +285,7 @@ async def send_email(
         blocked = [r for r in all_addrs if r not in settings.allowed_recipients]
         if blocked:
             for addr in blocked:
-                logger.warning("allowlist_block kind=recipient_send addr=%r", addr)
+                logger.warning(f"allowlist_block kind=recipient_send addr={addr!r}")
             raise ValueError(
                 f"Recipient(s) not in allowlist: {', '.join(blocked)}. "
                 f"Allowed: {', '.join(settings.allowed_recipients)}"
