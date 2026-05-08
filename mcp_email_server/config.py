@@ -282,10 +282,10 @@ class Settings(BaseSettings):
             self.allowed_senders = list(dict.fromkeys(p.strip().lower() for p in env_senders.split(",") if p.strip()))
 
         # homelab hardening: opt-in fail-closed mode for allowlists
-        env_required = os.getenv("MCP_EMAIL_SERVER_ALLOWLIST_REQUIRED")
-        if env_required is not None:
-            self.allowlist_required = _parse_bool_env(env_required, False)
-            logger.info(f"Set allowlist_required={self.allowlist_required} from environment variable")
+        # Extracted to a helper so __init__ stays under ruff C901's complexity ceiling
+        # AND so the homelab-specific branch is easy to remove on rebase if upstream
+        # ever absorbs the same setting under a different name.
+        self._apply_homelab_overrides()
 
         # Check for email configuration from environment variables
         env_email = EmailSettings.from_env()
@@ -305,6 +305,18 @@ class Settings(BaseSettings):
                 # Add new account from env
                 self.emails.insert(0, env_email)
                 logger.info(f"Added email account '{env_email.account_name}' from environment variables")
+
+    def _apply_homelab_overrides(self) -> None:
+        """Apply homelab-fork-only env-var overrides.
+
+        Kept in a separate method so __init__ stays under ruff's C901 ceiling
+        and so this branch is trivially removable on rebase if upstream ever
+        introduces an equivalent setting.
+        """
+        env_required = os.getenv("MCP_EMAIL_SERVER_ALLOWLIST_REQUIRED")
+        if env_required is not None:
+            self.allowlist_required = _parse_bool_env(env_required, False)
+            logger.info(f"Set allowlist_required={self.allowlist_required} from environment variable")
 
     def add_email(self, email: EmailSettings) -> None:
         """Use re-assigned for validation to work."""
