@@ -10,6 +10,11 @@ on:
 
 jobs:
   set-version:
+    # homelab fork: gate publish/release jobs to upstream-only.
+    # Defense-in-depth — we don't intend to cut releases on the fork; this stops
+    # accidental triggers from publishing to PyPI or pushing Docker images that
+    # would impersonate the upstream package.
+    if: github.repository == 'ai-zerolab/mcp-email-server'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
