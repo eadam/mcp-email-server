@@ -1,7 +1,28 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+
+class InlineAttachment(BaseModel):
+    """An attachment shipped to send_email / save_to_mailbox as inline bytes.
+
+    Used by remote MCP clients that cannot put a file on the server's
+    filesystem. The receiving server decodes ``content_base64`` and assembles
+    a MIME part using ``filename`` and ``mime_type``. Filename is sanitized
+    server-side; ``mime_type`` is auto-detected from the filename extension
+    if omitted.
+    """
+
+    filename: str = Field(description="Display filename, e.g. 'report.pdf'. Sanitized server-side.")
+    content_base64: str = Field(description="Standard base64-encoded file bytes. No whitespace, no 'data:' URI prefix.")
+    mime_type: str | None = Field(
+        default=None,
+        description=(
+            "Override MIME type as 'type/subtype'. If omitted, auto-detected from filename. "
+            "Must be a valid RFC 2045 token (e.g. 'image/png'); parameters are not supported."
+        ),
+    )
 
 
 class EmailMetadata(BaseModel):

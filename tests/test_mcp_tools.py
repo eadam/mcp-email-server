@@ -407,15 +407,16 @@ class TestMcpTools:
 
                 # Verify send_email was called correctly
                 mock_handler.send_email.assert_called_once_with(
-                    ["recipient@example.com"],
-                    "Test Subject",
-                    "Test Body",
-                    ["cc@example.com"],
-                    ["bcc@example.com"],
-                    False,
-                    None,
-                    None,  # in_reply_to
-                    None,  # references
+                    recipients=["recipient@example.com"],
+                    subject="Test Subject",
+                    body="Test Body",
+                    cc=["cc@example.com"],
+                    bcc=["bcc@example.com"],
+                    html=False,
+                    attachments=None,
+                    in_reply_to=None,
+                    references=None,
+                    inline_attachments=None,
                 )
 
     @pytest.mark.asyncio

@@ -18,6 +18,7 @@ from mcp_email_server.emails.models import (
     EmailContentBatchResponse,
     EmailMarkResponse,
     EmailMetadataPageResponse,
+    InlineAttachment,
     MailboxInfo,
 )
 from mcp_email_server.log import logger
@@ -236,6 +237,18 @@ async def send_email(
             description="Space-separated Message-IDs for the thread chain. Usually includes in_reply_to plus ancestors.",
         ),
     ] = None,
+    inline_attachments: Annotated[
+        list[InlineAttachment] | None,
+        Field(
+            default=None,
+            description=(
+                "Attachments shipped as inline base64 bytes — use this when the LLM and the server "
+                "do not share a filesystem (i.e. always, for remote MCP clients). Each item is "
+                "{filename, content_base64, mime_type?}. Combined with any path-based `attachments`. "
+                "Per-item and aggregate caps configurable via MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES* envs."
+            ),
+        ),
+    ] = None,
 ) -> str:
     settings = get_settings()
     # homelab hardening: fail-closed if required mode is on and no recipient allowlist set.
@@ -260,18 +273,20 @@ async def send_email(
             )
     handler = dispatch_handler(account_name)
     await handler.send_email(
-        recipients,
-        subject,
-        body,
-        cc,
-        bcc,
-        html,
-        attachments,
-        in_reply_to,
-        references,
+        recipients=recipients,
+        subject=subject,
+        body=body,
+        cc=cc,
+        bcc=bcc,
+        html=html,
+        attachments=attachments,
+        in_reply_to=in_reply_to,
+        references=references,
+        inline_attachments=inline_attachments,
     )
     recipient_str = ", ".join(recipients)
-    attachment_info = f" with {len(attachments)} attachment(s)" if attachments else ""
+    total_attachments = len(attachments or []) + len(inline_attachments or [])
+    attachment_info = f" with {total_attachments} attachment(s)" if total_attachments else ""
     return f"Email sent successfully to {recipient_str}{attachment_info}"
 
 
@@ -332,20 +347,33 @@ async def save_to_mailbox(
             description=r"IMAP flags to set on the message. Defaults to ['\\Draft', '\\Seen']. Common flags: '\\Draft', '\\Seen', '\\Flagged'.",
         ),
     ] = None,
+    inline_attachments: Annotated[
+        list[InlineAttachment] | None,
+        Field(
+            default=None,
+            description=(
+                "Attachments shipped as inline base64 bytes — use this when the LLM and the server "
+                "do not share a filesystem. Each item is {filename, content_base64, mime_type?}. "
+                "Combined with any path-based `attachments`. save_to_mailbox is intentionally exempt "
+                "from the recipient allowlist — drafts are the human-review gate."
+            ),
+        ),
+    ] = None,
 ) -> str:
     handler = dispatch_handler(account_name)
     result = await handler.save_to_mailbox(
-        recipients,
-        subject,
-        body,
-        mailbox,
-        cc,
-        bcc,
-        html,
-        attachments,
-        in_reply_to,
-        references,
-        flags,
+        recipients=recipients,
+        subject=subject,
+        body=body,
+        mailbox=mailbox,
+        cc=cc,
+        bcc=bcc,
+        html=html,
+        attachments=attachments,
+        in_reply_to=in_reply_to,
+        references=references,
+        flags=flags,
+        inline_attachments=inline_attachments,
     )
     # result format: "<message-id>|uid:<imap-uid>"
     parts = result.split("|uid:")

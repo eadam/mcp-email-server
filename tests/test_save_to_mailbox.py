@@ -476,15 +476,16 @@ class TestSaveToMailboxTool:
         )
         assert "INBOX.Drafts" in result
         mock_handler.save_to_mailbox.assert_called_once_with(
-            ["r@example.com"],
-            "Draft",
-            "body",
-            "INBOX.Drafts",
-            None,
-            None,
-            False,
-            None,
-            None,
-            None,
-            [r"\Draft", r"\Seen"],
+            recipients=["r@example.com"],
+            subject="Draft",
+            body="body",
+            mailbox="INBOX.Drafts",
+            cc=None,
+            bcc=None,
+            html=False,
+            attachments=None,
+            in_reply_to=None,
+            references=None,
+            flags=[r"\Draft", r"\Seen"],
+            inline_attachments=None,
         )
