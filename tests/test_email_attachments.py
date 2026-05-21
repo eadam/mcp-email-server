@@ -868,3 +868,64 @@ class TestPositionalCallRegression:
         # html-bool or attachments slot — and we'd see no In-Reply-To.
         assert sent["In-Reply-To"] == "<thread-root@example.com>"
         assert sent["References"] == "<thread-root@example.com>"
+
+
+class TestInlineDownloadAttachment:
+    """EmailClient.fetch_attachment_inline — handler-level behavior.
+
+    Lands with commit #4 of the inline-attachments feature.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_content_base64(self, email_client):
+        mock_imap = _imap_mock()
+        with patch.object(email_client, "_fetch_email_with_formats", AsyncMock(return_value=b"dummy")):
+            with patch.object(email_client, "_extract_raw_email", return_value=RAW_EMAIL_FROM_ALLOWED):
+                with patch.object(email_client, "imap_class", return_value=mock_imap):
+                    result = await email_client.fetch_attachment_inline(
+                        email_id="1",
+                        attachment_name="document.pdf",
+                        max_bytes=1024 * 1024,
+                    )
+        assert "content_base64" in result
+        # The PDF content "JVBERi0K" was base64 in the source — decoding once
+        # gives the attachment bytes, decoding our returned content_base64
+        # gives those same bytes back.
+        decoded = base64.b64decode(result["content_base64"])
+        assert decoded == base64.b64decode(b"JVBERi0K")
+        assert result["mime_type"] == "application/pdf"
+        assert result["attachment_name"] == "document.pdf"
+        assert result["size"] == len(decoded)
+
+    @pytest.mark.asyncio
+    async def test_inline_oversize_rejected_with_stable_message(self, email_client):
+        mock_imap = _imap_mock()
+        with patch.object(email_client, "_fetch_email_with_formats", AsyncMock(return_value=b"dummy")):
+            with patch.object(email_client, "_extract_raw_email", return_value=RAW_EMAIL_FROM_ALLOWED):
+                with patch.object(email_client, "imap_class", return_value=mock_imap):
+                    # PDF payload is ~5 bytes decoded; cap=1 forces rejection.
+                    with pytest.raises(ValueError, match=r"^Attachment too large for inline mode") as exc_info:
+                        await email_client.fetch_attachment_inline(
+                            email_id="1",
+                            attachment_name="document.pdf",
+                            max_bytes=1,
+                        )
+        # Error message includes size and cap, and the actionable remediation
+        # hint pointing at the env var + the disk-write alternative.
+        assert "exceeds cap 1" in str(exc_info.value)
+        assert "MCP_EMAIL_SERVER_MAX_INLINE_DOWNLOAD_BYTES" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_inline_allowlist_blocks_before_extract(self, email_client):
+        """Sender allowlist enforcement applies to inline mode too."""
+        mock_imap = _imap_mock()
+        with patch.object(email_client, "_fetch_email_with_formats", AsyncMock(return_value=b"dummy")):
+            with patch.object(email_client, "_extract_raw_email", return_value=RAW_EMAIL_FROM_BLOCKED):
+                with patch.object(email_client, "imap_class", return_value=mock_imap):
+                    with pytest.raises(ValueError, match=r"^Attachment download blocked:"):
+                        await email_client.fetch_attachment_inline(
+                            email_id="1",
+                            attachment_name="document.pdf",
+                            allowed_senders=["alice@example.com"],
+                            max_bytes=1024 * 1024,
+                        )

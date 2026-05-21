@@ -1255,3 +1255,149 @@ class TestDownloadAttachmentAllowlistToolLayer:
                         attachment_name="document.pdf",
                         save_path="/var/downloads/document.pdf",
                     )
+
+
+# ---- download_attachment inline mode (commit #4 of inline-attachments feature) ----
+
+
+class TestDownloadAttachmentInlineToolLayer:
+    @pytest.mark.asyncio
+    async def test_inline_true_routes_to_inline_handler(self):
+        """inline=True dispatches to download_attachment_inline with the configured cap."""
+        attachment_response = AttachmentDownloadResponse(
+            email_id="12345",
+            attachment_name="document.pdf",
+            mime_type="application/pdf",
+            size=1024,
+            content_base64="JVBERi0K",
+        )
+        mock_settings = MagicMock()
+        mock_settings.enable_attachment_download = True
+        mock_settings.allowed_senders = []
+        mock_settings.allowlist_required = False
+        mock_settings.max_inline_download_bytes = 25 * 1024 * 1024
+
+        mock_handler = AsyncMock()
+        mock_handler.download_attachment_inline.return_value = attachment_response
+
+        with patch("mcp_email_server.app.get_settings", return_value=mock_settings):
+            with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
+                result = await download_attachment(
+                    account_name="test_account",
+                    email_id="12345",
+                    attachment_name="document.pdf",
+                    inline=True,
+                )
+
+        assert result.content_base64 == "JVBERi0K"
+        assert result.saved_path is None
+        mock_handler.download_attachment_inline.assert_called_once_with(
+            "12345",
+            "document.pdf",
+            "INBOX",
+            allowed_senders=[],
+            max_bytes=25 * 1024 * 1024,
+        )
+        mock_handler.download_attachment.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_inline_false_without_save_path_raises_valueerror(self):
+        """inline=False without save_path is a clear caller error, not a silent download-to-cwd."""
+        mock_settings = MagicMock()
+        mock_settings.enable_attachment_download = True
+        mock_settings.allowed_senders = []
+        mock_settings.allowlist_required = False
+
+        with patch("mcp_email_server.app.get_settings", return_value=mock_settings):
+            with patch("mcp_email_server.app.dispatch_handler") as mock_dispatch:
+                with pytest.raises(ValueError, match="requires save_path when inline=False"):
+                    await download_attachment(
+                        account_name="test_account",
+                        email_id="12345",
+                        attachment_name="document.pdf",
+                    )
+                mock_dispatch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_inline_true_with_save_path_ignores_save_path_and_warns(self):
+        """save_path passed alongside inline=True is ignored — handler routed to inline mode."""
+        attachment_response = AttachmentDownloadResponse(
+            email_id="12345",
+            attachment_name="document.pdf",
+            mime_type="application/pdf",
+            size=1024,
+            content_base64="JVBERi0K",
+        )
+        mock_settings = MagicMock()
+        mock_settings.enable_attachment_download = True
+        mock_settings.allowed_senders = []
+        mock_settings.allowlist_required = False
+        mock_settings.max_inline_download_bytes = 25 * 1024 * 1024
+
+        mock_handler = AsyncMock()
+        mock_handler.download_attachment_inline.return_value = attachment_response
+
+        with patch("mcp_email_server.app.get_settings", return_value=mock_settings):
+            with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
+                with patch("mcp_email_server.app.logger") as mock_logger:
+                    result = await download_attachment(
+                        account_name="test_account",
+                        email_id="12345",
+                        attachment_name="document.pdf",
+                        save_path="/will/be/ignored",
+                        inline=True,
+                    )
+
+        assert result.content_base64 == "JVBERi0K"
+        mock_handler.download_attachment_inline.assert_called_once()
+        mock_handler.download_attachment.assert_not_called()
+        # Warning log mentions save_path being ignored.
+        warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
+        assert any("ignoring save_path" in c for c in warning_calls), warning_calls
+
+    @pytest.mark.asyncio
+    async def test_inline_true_honors_enable_attachment_download_gate(self):
+        """The exfiltration gate applies to inline mode too — not just the disk-write mode."""
+        mock_settings = MagicMock()
+        mock_settings.enable_attachment_download = False
+
+        with patch("mcp_email_server.app.get_settings", return_value=mock_settings):
+            with pytest.raises(PermissionError, match="Attachment download is disabled"):
+                await download_attachment(
+                    account_name="test_account",
+                    email_id="12345",
+                    attachment_name="document.pdf",
+                    inline=True,
+                )
+
+    @pytest.mark.asyncio
+    async def test_inline_true_blocked_sender_logs_and_reraises(self):
+        """Inline-mode allowlist block emits the same structured log as disk mode."""
+        mock_settings = MagicMock()
+        mock_settings.enable_attachment_download = True
+        mock_settings.allowed_senders = ["alice@example.com"]
+        mock_settings.allowlist_required = False
+        mock_settings.max_inline_download_bytes = 25 * 1024 * 1024
+
+        mock_handler = AsyncMock()
+        mock_handler.download_attachment_inline.side_effect = ValueError(
+            "Attachment download blocked: sender 'bob@evil.example' is not in the configured allowlist."
+        )
+
+        with patch("mcp_email_server.app.get_settings", return_value=mock_settings):
+            with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
+                with patch("mcp_email_server.app.logger") as mock_logger:
+                    with pytest.raises(ValueError, match="Attachment download blocked"):
+                        await download_attachment(
+                            account_name="test_account",
+                            email_id="12345",
+                            attachment_name="document.pdf",
+                            inline=True,
+                        )
+
+        block_calls = [
+            c
+            for c in mock_logger.warning.call_args_list
+            if "allowlist_block" in str(c) and "kind=attachment_download" in str(c)
+        ]
+        assert len(block_calls) == 1

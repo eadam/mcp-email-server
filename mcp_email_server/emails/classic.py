@@ -938,6 +938,50 @@ class EmailClient:
             "saved_path": str(save_file.resolve()),
         }
 
+    async def fetch_attachment_inline(
+        self,
+        email_id: str,
+        attachment_name: str,
+        mailbox: str = "INBOX",
+        *,
+        allowed_senders: list[str] | None = None,
+        max_bytes: int,
+    ) -> dict[str, Any]:
+        """Return an attachment as base64-encoded bytes in the MCP response.
+
+        Symmetric companion to :py:meth:`download_attachment` for remote MCP
+        clients that cannot read the server's filesystem. Same IMAP fetch and
+        sender allowlist enforcement as the disk-write path — the difference is
+        purely where the bytes go.
+
+        Raises:
+            ValueError: If the attachment is larger than ``max_bytes`` (stable
+                message includes size + cap + remediation hint), or any error
+                from :py:meth:`_fetch_attachment_bytes` (allowlist block, IMAP
+                fetch failure, attachment not found).
+        """
+        fetched = await self._fetch_attachment_bytes(
+            email_id,
+            attachment_name,
+            mailbox,
+            allowed_senders=allowed_senders,
+        )
+        if len(fetched.data) > max_bytes:
+            raise ValueError(
+                f"Attachment too large for inline mode: {len(fetched.data)} bytes exceeds cap {max_bytes}. "
+                f"Use inline=False with a writable save_path, or raise MCP_EMAIL_SERVER_MAX_INLINE_DOWNLOAD_BYTES."
+            )
+
+        encoded = base64.b64encode(fetched.data).decode("ascii")
+        logger.info(f"Attachment '{fetched.filename}' returned inline ({len(fetched.data)} bytes)")
+        return {
+            "email_id": email_id,
+            "attachment_name": fetched.filename,
+            "mime_type": fetched.mime_type,
+            "size": len(fetched.data),
+            "content_base64": encoded,
+        }
+
     def _validate_attachment(self, file_path: str) -> Path:
         """Validate attachment file path."""
         path = Path(file_path)
@@ -1768,4 +1812,33 @@ class ClassicEmailHandler(EmailHandler):
             mime_type=result["mime_type"],
             size=result["size"],
             saved_path=result["saved_path"],
+        )
+
+    async def download_attachment_inline(
+        self,
+        email_id: str,
+        attachment_name: str,
+        mailbox: str = "INBOX",
+        *,
+        allowed_senders: list[str] | None = None,
+        max_bytes: int,
+    ) -> AttachmentDownloadResponse:
+        """Download an email attachment as inline base64 bytes (no disk write).
+
+        Symmetric companion to :py:meth:`download_attachment` for remote MCP
+        clients that cannot read the server's filesystem.
+        """
+        result = await self.incoming_client.fetch_attachment_inline(
+            email_id,
+            attachment_name,
+            mailbox,
+            allowed_senders=allowed_senders,
+            max_bytes=max_bytes,
+        )
+        return AttachmentDownloadResponse(
+            email_id=result["email_id"],
+            attachment_name=result["attachment_name"],
+            mime_type=result["mime_type"],
+            size=result["size"],
+            content_base64=result["content_base64"],
         )
