@@ -156,6 +156,8 @@ class EmailHandler(abc.ABC):
         attachment_name: str,
         save_path: str,
         mailbox: str = "INBOX",
+        *,
+        allowed_senders: list[str] | None = None,
     ) -> "AttachmentDownloadResponse":
         """
         Download an email attachment and save it to the specified path.
@@ -165,6 +167,10 @@ class EmailHandler(abc.ABC):
             attachment_name: The filename of the attachment to download.
             save_path: The local path where the attachment will be saved.
             mailbox: The mailbox to search in (default: "INBOX").
+            allowed_senders: Optional sender allowlist; if non-empty, the
+                email's ``From`` header must match one of the patterns before
+                the attachment is returned. Per-message check; the fail-closed
+                ``allowlist_required`` pre-check lives in the MCP tool layer.
 
         Returns:
             AttachmentDownloadResponse with download result information.

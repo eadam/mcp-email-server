@@ -303,7 +303,7 @@ class TestClassicEmailHandler:
             assert result.size == 1024
             assert result.saved_path == save_path
 
-            mock_download.assert_called_once_with("123", "document.pdf", save_path, "INBOX")
+            mock_download.assert_called_once_with("123", "document.pdf", save_path, "INBOX", allowed_senders=None)
 
     @pytest.mark.asyncio
     async def test_send_email_with_reply_headers(self, classic_handler):

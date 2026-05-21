@@ -494,6 +494,8 @@ class TestMcpTools:
 
         mock_settings = MagicMock()
         mock_settings.enable_attachment_download = True
+        mock_settings.allowed_senders = []
+        mock_settings.allowlist_required = False
 
         mock_handler = AsyncMock()
         mock_handler.download_attachment.return_value = attachment_response
@@ -514,7 +516,11 @@ class TestMcpTools:
                 assert result.size == 1024
 
                 mock_handler.download_attachment.assert_called_once_with(
-                    "12345", "document.pdf", "/var/downloads/document.pdf", "INBOX"
+                    "12345",
+                    "document.pdf",
+                    "/var/downloads/document.pdf",
+                    "INBOX",
+                    allowed_senders=[],
                 )
 
     @pytest.mark.asyncio
@@ -1126,3 +1132,125 @@ class TestSenderAllowed:
         # string lands in the address slot since there are no angle brackets. Either way
         # the result does not match a normal pattern like *@example.com.
         assert _sender_allowed("not-an-email-at-all", ["*@example.com"]) is False
+
+
+# ---- Sender-allowlist gate on download_attachment (tool layer) ----
+# Lands with commit #1 of the inline-attachments feature. Tests the
+# fail-closed pre-check in the app.py tool body and the structured logging
+# pattern. The handler-level / IMAP-level checks live in test_email_attachments.
+
+
+class TestDownloadAttachmentAllowlistToolLayer:
+    @pytest.mark.asyncio
+    async def test_required_mode_empty_allowlist_blocks_before_imap(self):
+        """allowlist_required=True + empty allowed_senders → ValueError before any IMAP work."""
+        mock_settings = MagicMock()
+        mock_settings.enable_attachment_download = True
+        mock_settings.allowed_senders = []
+        mock_settings.allowlist_required = True
+
+        mock_dispatch = MagicMock()
+
+        with patch("mcp_email_server.app.get_settings", return_value=mock_settings):
+            with patch("mcp_email_server.app.dispatch_handler", mock_dispatch):
+                with pytest.raises(ValueError, match=r"^Sender allowlist is required"):
+                    await download_attachment(
+                        account_name="test_account",
+                        email_id="12345",
+                        attachment_name="document.pdf",
+                        save_path="/var/downloads/document.pdf",
+                    )
+
+        # Crucial assertion: handler is never dispatched, so no IMAP connection
+        # is opened. The gate trips before any network work.
+        mock_dispatch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_passes_allowed_senders_to_handler(self):
+        """Tool body must thread the configured allowlist down to the handler."""
+        attachment_response = AttachmentDownloadResponse(
+            email_id="12345",
+            attachment_name="document.pdf",
+            mime_type="application/pdf",
+            size=1024,
+            saved_path="/var/downloads/document.pdf",
+        )
+        mock_settings = MagicMock()
+        mock_settings.enable_attachment_download = True
+        mock_settings.allowed_senders = ["alice@example.com", "*@trusted.org"]
+        mock_settings.allowlist_required = False
+
+        mock_handler = AsyncMock()
+        mock_handler.download_attachment.return_value = attachment_response
+
+        with patch("mcp_email_server.app.get_settings", return_value=mock_settings):
+            with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
+                await download_attachment(
+                    account_name="test_account",
+                    email_id="12345",
+                    attachment_name="document.pdf",
+                    save_path="/var/downloads/document.pdf",
+                )
+
+        mock_handler.download_attachment.assert_called_once_with(
+            "12345",
+            "document.pdf",
+            "/var/downloads/document.pdf",
+            "INBOX",
+            allowed_senders=["alice@example.com", "*@trusted.org"],
+        )
+
+    @pytest.mark.asyncio
+    async def test_handler_block_emits_structured_log_and_reraises(self):
+        """Handler raises Attachment-download-blocked ValueError → tool logs allowlist_block then re-raises."""
+        mock_settings = MagicMock()
+        mock_settings.enable_attachment_download = True
+        mock_settings.allowed_senders = ["alice@example.com"]
+        mock_settings.allowlist_required = False
+
+        mock_handler = AsyncMock()
+        mock_handler.download_attachment.side_effect = ValueError(
+            "Attachment download blocked: sender 'bob@evil.example' is not in the configured allowlist."
+        )
+
+        with patch("mcp_email_server.app.get_settings", return_value=mock_settings):
+            with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
+                with patch("mcp_email_server.app.logger") as mock_logger:
+                    with pytest.raises(ValueError, match="Attachment download blocked"):
+                        await download_attachment(
+                            account_name="test_account",
+                            email_id="12345",
+                            attachment_name="document.pdf",
+                            save_path="/var/downloads/document.pdf",
+                        )
+
+        # Confirm the structured allowlist_block warning was emitted with the
+        # email_id field present. This is what an operator would grep for.
+        block_calls = [
+            c
+            for c in mock_logger.warning.call_args_list
+            if "allowlist_block" in str(c) and "kind=attachment_download" in str(c)
+        ]
+        assert len(block_calls) == 1, f"expected one allowlist_block log, got: {mock_logger.warning.call_args_list}"
+        assert "12345" in str(block_calls[0])
+
+    @pytest.mark.asyncio
+    async def test_unrelated_value_error_passes_through_without_block_log(self):
+        """A non-allowlist ValueError (e.g. attachment not found) re-raises but does NOT emit allowlist_block."""
+        mock_settings = MagicMock()
+        mock_settings.enable_attachment_download = True
+        mock_settings.allowed_senders = []
+        mock_settings.allowlist_required = False
+
+        mock_handler = AsyncMock()
+        mock_handler.download_attachment.side_effect = ValueError("Attachment 'document.pdf' not found in email 12345")
+
+        with patch("mcp_email_server.app.get_settings", return_value=mock_settings):
+            with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
+                with pytest.raises(ValueError, match="not found in email"):
+                    await download_attachment(
+                        account_name="test_account",
+                        email_id="12345",
+                        attachment_name="document.pdf",
+                        save_path="/var/downloads/document.pdf",
+                    )

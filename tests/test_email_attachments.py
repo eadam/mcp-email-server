@@ -298,3 +298,134 @@ class TestDownloadAttachmentMailboxParam:
 
                 # Verify select was called with quoted special folder
                 mock_imap.select.assert_called_once_with('"[Gmail]/Sent Mail"')
+
+
+# ---- Sender-allowlist gate on download_attachment ----
+# Lands with commit #1 of the inline-attachments feature. Inline-mode cases
+# are appended below in commit #4 once download_attachment_inline exists.
+
+RAW_EMAIL_FROM_BLOCKED = (
+    b"From: blocked@evil.example\r\n"
+    b"To: me@me.com\r\n"
+    b"Subject: hi\r\n"
+    b'Content-Type: multipart/mixed; boundary="b"\r\n'
+    b"\r\n"
+    b"--b\r\n"
+    b"Content-Type: text/plain\r\n"
+    b"\r\n"
+    b"body\r\n"
+    b"--b\r\n"
+    b"Content-Type: application/pdf\r\n"
+    b'Content-Disposition: attachment; filename="document.pdf"\r\n'
+    b"Content-Transfer-Encoding: base64\r\n"
+    b"\r\n"
+    b"JVBERi0K\r\n"
+    b"--b--\r\n"
+)
+
+RAW_EMAIL_FROM_ALLOWED = RAW_EMAIL_FROM_BLOCKED.replace(b"From: blocked@evil.example", b"From: alice@example.com")
+
+
+def _imap_mock():
+    import asyncio
+
+    mock_imap = AsyncMock()
+    mock_imap._client_task = asyncio.Future()
+    mock_imap._client_task.set_result(None)
+    mock_imap.wait_hello_from_server = AsyncMock()
+    mock_imap.login = AsyncMock()
+    mock_imap.select = AsyncMock(return_value=("OK", [b"1"]))
+    mock_imap.logout = AsyncMock()
+    return mock_imap
+
+
+class TestDownloadAttachmentAllowlist:
+    """Sender-allowlist enforcement on the EmailClient.download_attachment path.
+
+    The check happens against the From header of the already-fetched parsed
+    message — one IMAP fetch per call, not two.
+    """
+
+    @pytest.mark.asyncio
+    async def test_blocked_sender_raises_with_stable_message(self, email_client, tmp_path):
+        save_path = str(tmp_path / "attachment.pdf")
+        mock_imap = _imap_mock()
+        with patch.object(email_client, "_fetch_email_with_formats", AsyncMock(return_value=b"dummy")) as mock_fetch:
+            with patch.object(email_client, "_extract_raw_email", return_value=RAW_EMAIL_FROM_BLOCKED):
+                with patch.object(email_client, "imap_class", return_value=mock_imap):
+                    with pytest.raises(ValueError, match=r"^Attachment download blocked:"):
+                        await email_client.download_attachment(
+                            email_id="1",
+                            attachment_name="document.pdf",
+                            save_path=save_path,
+                            allowed_senders=["alice@example.com"],
+                        )
+            # Exactly one IMAP fetch — proves the gate doesn't introduce a
+            # separate header-only round-trip.
+            assert mock_fetch.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_blocked_sender_error_does_not_leak_attachment_bytes(self, email_client, tmp_path):
+        """Per logging-discipline rule: error message must not contain attachment payload."""
+        save_path = str(tmp_path / "attachment.pdf")
+        mock_imap = _imap_mock()
+        with patch.object(email_client, "_fetch_email_with_formats", AsyncMock(return_value=b"dummy")):
+            with patch.object(email_client, "_extract_raw_email", return_value=RAW_EMAIL_FROM_BLOCKED):
+                with patch.object(email_client, "imap_class", return_value=mock_imap):
+                    with pytest.raises(ValueError) as exc_info:
+                        await email_client.download_attachment(
+                            email_id="1",
+                            attachment_name="document.pdf",
+                            save_path=save_path,
+                            allowed_senders=["alice@example.com"],
+                        )
+        # The base64 payload "JVBERi0K" must not appear in any error text.
+        assert "JVBERi0K" not in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_allowed_sender_succeeds(self, email_client, tmp_path):
+        save_path = str(tmp_path / "attachment.pdf")
+        mock_imap = _imap_mock()
+        with patch.object(email_client, "_fetch_email_with_formats", AsyncMock(return_value=b"dummy")) as mock_fetch:
+            with patch.object(email_client, "_extract_raw_email", return_value=RAW_EMAIL_FROM_ALLOWED):
+                with patch.object(email_client, "imap_class", return_value=mock_imap):
+                    result = await email_client.download_attachment(
+                        email_id="1",
+                        attachment_name="document.pdf",
+                        save_path=save_path,
+                        allowed_senders=["alice@example.com"],
+                    )
+        assert result["attachment_name"] == "document.pdf"
+        assert mock_fetch.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_no_allowlist_skips_sender_check(self, email_client, tmp_path):
+        """Empty / None allowed_senders means no per-message check; previously-blocked sender now passes."""
+        save_path = str(tmp_path / "attachment.pdf")
+        mock_imap = _imap_mock()
+        with patch.object(email_client, "_fetch_email_with_formats", AsyncMock(return_value=b"dummy")):
+            with patch.object(email_client, "_extract_raw_email", return_value=RAW_EMAIL_FROM_BLOCKED):
+                with patch.object(email_client, "imap_class", return_value=mock_imap):
+                    # allowed_senders=None — equivalent to no allowlist configured
+                    result = await email_client.download_attachment(
+                        email_id="1",
+                        attachment_name="document.pdf",
+                        save_path=save_path,
+                        allowed_senders=None,
+                    )
+        assert result["attachment_name"] == "document.pdf"
+
+    @pytest.mark.asyncio
+    async def test_glob_pattern_matches(self, email_client, tmp_path):
+        save_path = str(tmp_path / "attachment.pdf")
+        mock_imap = _imap_mock()
+        with patch.object(email_client, "_fetch_email_with_formats", AsyncMock(return_value=b"dummy")):
+            with patch.object(email_client, "_extract_raw_email", return_value=RAW_EMAIL_FROM_ALLOWED):
+                with patch.object(email_client, "imap_class", return_value=mock_imap):
+                    result = await email_client.download_attachment(
+                        email_id="1",
+                        attachment_name="document.pdf",
+                        save_path=save_path,
+                        allowed_senders=["*@example.com"],
+                    )
+        assert result["attachment_name"] == "document.pdf"

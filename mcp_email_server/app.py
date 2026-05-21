@@ -1,11 +1,11 @@
-import fnmatch
 from datetime import datetime
-from email import utils as email_utils
 from typing import Annotated, Literal
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
+from mcp_email_server.allowlist import normalize_addrs as _normalize_addrs
+from mcp_email_server.allowlist import sender_allowed as _sender_allowed
 from mcp_email_server.config import (
     AccountAttributes,
     EmailSettings,
@@ -23,38 +23,6 @@ from mcp_email_server.emails.models import (
 from mcp_email_server.log import logger
 
 mcp = FastMCP("email")
-
-
-def _normalize_addrs(raw: list[str]) -> list[str]:
-    """Extract bare lower-cased email addresses from a list of recipient strings.
-
-    Strips display-name forms like 'Foo <bad@evil.example>' down to the angle-addr
-    component before allowlist comparison. Closes the display-name bypass where a
-    well-formed allowlist entry could be evaded by wrapping the real address in
-    a friendly display name.
-    """
-    normalized: list[str] = []
-    for name_addr in email_utils.getaddresses(raw):
-        addr = name_addr[1].strip().lower() if name_addr[1] else ""
-        if addr:
-            normalized.append(addr)
-    return normalized
-
-
-def _sender_allowed(sender: str, patterns: list[str]) -> bool:
-    """Return True if sender matches any pattern in the allowlist, or if the list is empty.
-
-    Handles 'Name <addr>' format via email.utils.parseaddr. Matching is case-insensitive.
-    Patterns support fnmatch globs (e.g. *@example.com).
-
-    Unparseable sender strings (malformed From headers) are treated as not allowed
-    when an allowlist is configured — the safe default for the threat model.
-    """
-    if not patterns:
-        return True
-    _, addr = email_utils.parseaddr(sender)  # handles "Name <addr>" and bare addresses
-    addr = (addr or sender).lower()  # fallback to raw string if parse fails
-    return any(fnmatch.fnmatch(addr, pattern.lower()) for pattern in patterns)
 
 
 @mcp.resource("email://{account_name}")
@@ -505,7 +473,12 @@ async def mark_emails(
 
 
 @mcp.tool(
-    description="Download an email attachment and save it to the specified path. This feature must be explicitly enabled in settings (enable_attachment_download=true) due to security considerations.",
+    description=(
+        "Download an email attachment and save it to the specified path. "
+        "Must be explicitly enabled in settings (enable_attachment_download=true) — once enabled, "
+        "this tool exfiltrates attachment bytes from the server, so the sender allowlist is "
+        "enforced on the email's From header before the attachment is read."
+    ),
 )
 async def download_attachment(
     account_name: Annotated[str, Field(description="The name of the email account.")],
@@ -525,5 +498,30 @@ async def download_attachment(
         )
         raise PermissionError(msg)
 
+    # Fail-closed pre-check: don't even open IMAP if required-mode is on but
+    # no allowlist is configured. Mirrors the read-tool pattern.
+    allowed = settings.allowed_senders
+    if getattr(settings, "allowlist_required", False) is True and not allowed:
+        logger.warning("allowlist_block kind=attachment_download reason=required-mode-empty-allowlist")
+        raise ValueError(
+            "Sender allowlist is required (MCP_EMAIL_SERVER_ALLOWLIST_REQUIRED=true) "
+            "but allowed_senders is empty. Configure MCP_EMAIL_SERVER_ALLOWED_SENDERS."
+        )
+
     handler = dispatch_handler(account_name)
-    return await handler.download_attachment(email_id, attachment_name, save_path, mailbox)
+    try:
+        return await handler.download_attachment(
+            email_id,
+            attachment_name,
+            save_path,
+            mailbox,
+            allowed_senders=allowed,
+        )
+    except ValueError as exc:
+        # Per-message allowlist block: handler raises with a stable
+        # "Attachment download blocked: sender ..." message. Convert to the
+        # standard structured log line then re-raise so the LLM sees the
+        # rejection.
+        if str(exc).startswith("Attachment download blocked:"):
+            logger.warning(f"allowlist_block kind=attachment_download email_id={email_id!r}")
+        raise

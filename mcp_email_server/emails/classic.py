@@ -18,6 +18,7 @@ from typing import Any
 import aioimaplib
 import aiosmtplib
 
+from mcp_email_server.allowlist import sender_allowed
 from mcp_email_server.config import EmailServer, EmailSettings
 from mcp_email_server.emails import EmailHandler
 from mcp_email_server.emails.models import (
@@ -647,12 +648,14 @@ class EmailClient:
             except Exception as e:
                 logger.info(f"Error during logout: {e}")
 
-    async def download_attachment(
+    async def download_attachment(  # noqa: C901
         self,
         email_id: str,
         attachment_name: str,
         save_path: str,
         mailbox: str = "INBOX",
+        *,
+        allowed_senders: list[str] | None = None,
     ) -> dict[str, Any]:
         """Download a specific attachment from an email and save it to disk.
 
@@ -661,9 +664,18 @@ class EmailClient:
             attachment_name: The filename of the attachment to download.
             save_path: The local path where the attachment will be saved.
             mailbox: The mailbox to search in (default: "INBOX").
+            allowed_senders: If non-empty, the email's ``From`` header must match
+                one of the patterns (fnmatch globs supported, case-insensitive)
+                or the call is rejected before attachment bytes are extracted.
+                None / empty list = no per-message check (the fail-closed
+                ``allowlist_required`` pre-check lives in the MCP tool layer).
 
         Returns:
             A dictionary with download result information.
+
+        Raises:
+            ValueError: If the sender is not in ``allowed_senders``, or the
+                requested attachment cannot be located.
         """
         imap = self._imap_connect()
         try:
@@ -688,6 +700,17 @@ class EmailClient:
 
             parser = BytesParser(policy=default)
             email_message = parser.parsebytes(raw_email)
+
+            # Sender allowlist enforcement — happens after parse so the
+            # already-fetched From header is reused; no extra IMAP round-trip.
+            # Caller (app.py download_attachment) is responsible for the
+            # fail-closed `allowlist_required` pre-check.
+            if allowed_senders:
+                from_header = str(email_message.get("From", ""))
+                if not sender_allowed(from_header, allowed_senders):
+                    raise ValueError(
+                        f"Attachment download blocked: sender {from_header!r} is not in the configured allowlist."
+                    )
 
             # Find the attachment
             attachment_data = None
@@ -1430,6 +1453,8 @@ class ClassicEmailHandler(EmailHandler):
         attachment_name: str,
         save_path: str,
         mailbox: str = "INBOX",
+        *,
+        allowed_senders: list[str] | None = None,
     ) -> AttachmentDownloadResponse:
         """Download an email attachment and save it to the specified path.
 
@@ -1438,11 +1463,19 @@ class ClassicEmailHandler(EmailHandler):
             attachment_name: The filename of the attachment to download.
             save_path: The local path where the attachment will be saved.
             mailbox: The mailbox to search in (default: "INBOX").
+            allowed_senders: Optional sender allowlist enforced before the
+                attachment is extracted. See ``EmailClient.download_attachment``.
 
         Returns:
             AttachmentDownloadResponse with download result information.
         """
-        result = await self.incoming_client.download_attachment(email_id, attachment_name, save_path, mailbox)
+        result = await self.incoming_client.download_attachment(
+            email_id,
+            attachment_name,
+            save_path,
+            mailbox,
+            allowed_senders=allowed_senders,
+        )
         return AttachmentDownloadResponse(
             email_id=result["email_id"],
             attachment_name=result["attachment_name"],
