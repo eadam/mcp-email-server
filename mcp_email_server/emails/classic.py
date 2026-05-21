@@ -6,14 +6,15 @@ import ssl
 import time
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
+from email import encoders
 from email.header import Header
-from email.mime.application import MIMEApplication
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.parser import BytesParser
 from email.policy import default
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import aioimaplib
 import aiosmtplib
@@ -115,6 +116,37 @@ def _create_ssl_context(verify_ssl: bool) -> ssl.SSLContext | None:
 
 # Backwards-compatible alias
 _create_smtp_ssl_context = _create_ssl_context
+
+
+class _ResolvedAttachment(NamedTuple):
+    """An attachment resolved to MIME-assembly-ready bytes.
+
+    Inputs to the send pipeline (file paths today; inline base64 in a
+    forthcoming commit) get normalized into this shape before being added
+    to a MIMEMultipart. Keeping ``maintype`` / ``subtype`` separate avoids
+    the historical bug where ``MIMEApplication(_subtype=mime_type.split("/")[1])``
+    converted every type into ``application/<subtype>`` — e.g. ``image/png``
+    silently shipped as ``application/png``.
+    """
+
+    filename: str
+    data: bytes
+    maintype: str
+    subtype: str
+
+
+class _FetchedAttachment(NamedTuple):
+    """An attachment extracted from a fetched IMAP message.
+
+    The ``filename`` field is the value pulled from the parsed MIME part
+    (already decoded by ``policy=default``), not the caller-supplied
+    attachment name — so the inline-download response shows the same
+    filename a mail client would.
+    """
+
+    data: bytes
+    mime_type: str
+    filename: str
 
 
 class EmailClient:
@@ -648,33 +680,57 @@ class EmailClient:
             except Exception as e:
                 logger.info(f"Error during logout: {e}")
 
-    async def download_attachment(  # noqa: C901
+    @staticmethod
+    def _find_attachment_part(email_message, attachment_name: str) -> _FetchedAttachment | None:
+        """Walk a parsed message and return the named attachment, or None.
+
+        Looks at every part with a ``Content-Disposition`` header that mentions
+        ``attachment`` and returns the first match by filename.
+        """
+        if not email_message.is_multipart():
+            return None
+        for part in email_message.walk():
+            content_disposition = str(part.get("Content-Disposition", ""))
+            if "attachment" not in content_disposition:
+                continue
+            filename = part.get_filename()
+            if filename != attachment_name:
+                continue
+            return _FetchedAttachment(
+                data=part.get_payload(decode=True),
+                mime_type=part.get_content_type(),
+                filename=filename,
+            )
+        return None
+
+    async def _fetch_attachment_bytes(
         self,
         email_id: str,
         attachment_name: str,
-        save_path: str,
         mailbox: str = "INBOX",
         *,
         allowed_senders: list[str] | None = None,
-    ) -> dict[str, Any]:
-        """Download a specific attachment from an email and save it to disk.
+    ) -> _FetchedAttachment:
+        """Fetch + parse the email, enforce the sender allowlist, extract the attachment.
+
+        Returns the raw bytes, MIME type, and the filename as the parsed MIME
+        part reports it (which may differ from ``attachment_name`` if encoded
+        headers normalize differently).
+
+        One IMAP round-trip total — the same fetch covers both the sender
+        check (against ``From``) and the attachment extraction.
 
         Args:
             email_id: The UID of the email containing the attachment.
             attachment_name: The filename of the attachment to download.
-            save_path: The local path where the attachment will be saved.
             mailbox: The mailbox to search in (default: "INBOX").
-            allowed_senders: If non-empty, the email's ``From`` header must match
-                one of the patterns (fnmatch globs supported, case-insensitive)
-                or the call is rejected before attachment bytes are extracted.
-                None / empty list = no per-message check (the fail-closed
-                ``allowlist_required`` pre-check lives in the MCP tool layer).
-
-        Returns:
-            A dictionary with download result information.
+            allowed_senders: Optional per-message allowlist; if non-empty,
+                the email's ``From`` header must match before extraction.
+                Fail-closed required-mode lives in the MCP tool layer.
 
         Raises:
-            ValueError: If the sender is not in ``allowed_senders``, or the
+            ValueError: If the sender is not in ``allowed_senders`` (stable
+                message prefix ``"Attachment download blocked:"``), or the
                 requested attachment cannot be located.
         """
         imap = self._imap_connect()
@@ -703,8 +759,6 @@ class EmailClient:
 
             # Sender allowlist enforcement — happens after parse so the
             # already-fetched From header is reused; no extra IMAP round-trip.
-            # Caller (app.py download_attachment) is responsible for the
-            # fail-closed `allowlist_required` pre-check.
             if allowed_senders:
                 from_header = str(email_message.get("From", ""))
                 if not sender_allowed(from_header, allowed_senders):
@@ -712,45 +766,64 @@ class EmailClient:
                         f"Attachment download blocked: sender {from_header!r} is not in the configured allowlist."
                     )
 
-            # Find the attachment
-            attachment_data = None
-            mime_type = None
-
-            if email_message.is_multipart():
-                for part in email_message.walk():
-                    content_disposition = str(part.get("Content-Disposition", ""))
-                    if "attachment" in content_disposition:
-                        filename = part.get_filename()
-                        if filename == attachment_name:
-                            attachment_data = part.get_payload(decode=True)
-                            mime_type = part.get_content_type()
-                            break
-
-            if attachment_data is None:
+            found = self._find_attachment_part(email_message, attachment_name)
+            if found is None:
                 msg = f"Attachment '{attachment_name}' not found in email {email_id}"
                 logger.error(msg)
                 raise ValueError(msg)
 
-            # Save to disk
-            save_file = Path(save_path)
-            save_file.parent.mkdir(parents=True, exist_ok=True)
-            save_file.write_bytes(attachment_data)
-
-            logger.info(f"Attachment '{attachment_name}' saved to {save_path}")
-
-            return {
-                "email_id": email_id,
-                "attachment_name": attachment_name,
-                "mime_type": mime_type or "application/octet-stream",
-                "size": len(attachment_data),
-                "saved_path": str(save_file.resolve()),
-            }
+            return found
 
         finally:
             try:
                 await imap.logout()
             except Exception as e:
                 logger.info(f"Error during logout: {e}")
+
+    async def download_attachment(
+        self,
+        email_id: str,
+        attachment_name: str,
+        save_path: str,
+        mailbox: str = "INBOX",
+        *,
+        allowed_senders: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Download a specific attachment from an email and save it to disk.
+
+        Thin wrapper over :py:meth:`_fetch_attachment_bytes` that writes the
+        returned bytes to ``save_path``. The sender allowlist check and the
+        IMAP fetch / parse live in the underlying helper.
+
+        Args:
+            email_id: The UID of the email containing the attachment.
+            attachment_name: The filename of the attachment to download.
+            save_path: The local path where the attachment will be saved.
+            mailbox: The mailbox to search in (default: "INBOX").
+            allowed_senders: Optional per-message sender allowlist.
+
+        Returns:
+            A dictionary with download result information.
+        """
+        fetched = await self._fetch_attachment_bytes(
+            email_id,
+            attachment_name,
+            mailbox,
+            allowed_senders=allowed_senders,
+        )
+
+        save_file = Path(save_path)
+        save_file.parent.mkdir(parents=True, exist_ok=True)
+        save_file.write_bytes(fetched.data)
+        logger.info(f"Attachment '{fetched.filename}' saved to {save_path}")
+
+        return {
+            "email_id": email_id,
+            "attachment_name": attachment_name,
+            "mime_type": fetched.mime_type,
+            "size": len(fetched.data),
+            "saved_path": str(save_file.resolve()),
+        }
 
     def _validate_attachment(self, file_path: str) -> Path:
         """Validate attachment file path."""
@@ -767,39 +840,47 @@ class EmailClient:
 
         return path
 
-    def _create_attachment_part(self, path: Path) -> MIMEApplication:
-        """Create MIME attachment part from file."""
+    def _resolve_path_attachment(self, file_path: str) -> _ResolvedAttachment:
+        """Read a file path into a _ResolvedAttachment with correct maintype/subtype.
+
+        Replaces the old ``MIMEApplication(_subtype=mime_type.split("/")[1])``
+        flow, which mangled non-application MIME types (e.g. ``image/png``
+        became ``application/png``).
+        """
+        path = self._validate_attachment(file_path)
         with open(path, "rb") as f:
-            file_data = f.read()
+            data = f.read()
 
         mime_type, _ = mimetypes.guess_type(str(path))
-        if mime_type is None:
+        if mime_type is None or "/" not in mime_type:
             mime_type = "application/octet-stream"
+        maintype, _, subtype = mime_type.partition("/")
+        return _ResolvedAttachment(filename=path.name, data=data, maintype=maintype, subtype=subtype)
 
-        attachment_part = MIMEApplication(file_data, _subtype=mime_type.split("/")[1])
-        attachment_part.add_header(
-            "Content-Disposition",
-            "attachment",
-            filename=path.name,
-        )
-        logger.info(f"Attached file: {path.name} ({mime_type})")
-        return attachment_part
+    def _build_attachment_part(self, resolved: _ResolvedAttachment) -> MIMEBase:
+        """Build a MIMEBase part from a resolved attachment, preserving maintype/subtype.
 
-    def _create_message_with_attachments(self, body: str, html: bool, attachments: list[str]) -> MIMEMultipart:
-        """Create multipart message with attachments."""
+        Uses MIMEBase + encoders.encode_base64 rather than MIMEApplication so
+        that an ``image/png`` attachment actually has Content-Type ``image/png``.
+        """
+        part = MIMEBase(resolved.maintype, resolved.subtype)
+        part.set_payload(resolved.data)
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", "attachment", filename=resolved.filename)
+        logger.info(f"Attached file: {resolved.filename} ({resolved.maintype}/{resolved.subtype})")
+        return part
+
+    def _create_message_with_attachments(
+        self, body: str, html: bool, attachments: list[_ResolvedAttachment]
+    ) -> MIMEMultipart:
+        """Create multipart message with already-resolved attachments."""
         msg = MIMEMultipart()
         content_type = "html" if html else "plain"
         text_part = MIMEText(body, content_type, "utf-8")
         msg.attach(text_part)
 
-        for file_path in attachments:
-            try:
-                path = self._validate_attachment(file_path)
-                attachment_part = self._create_attachment_part(path)
-                msg.attach(attachment_part)
-            except Exception as e:
-                logger.error(f"Failed to attach file {file_path}: {e}")
-                raise
+        for attachment in attachments:
+            msg.attach(self._build_attachment_part(attachment))
 
         return msg
 
@@ -828,7 +909,14 @@ class EmailClient:
         via the SMTP envelope only.
         """
         if attachments:
-            msg = self._create_message_with_attachments(body, html, attachments)
+            resolved: list[_ResolvedAttachment] = []
+            for file_path in attachments:
+                try:
+                    resolved.append(self._resolve_path_attachment(file_path))
+                except Exception as e:
+                    logger.error(f"Failed to attach file {file_path}: {e}")
+                    raise
+            msg = self._create_message_with_attachments(body, html, resolved)
         else:
             content_type = "html" if html else "plain"
             msg = MIMEText(body, content_type, "utf-8")

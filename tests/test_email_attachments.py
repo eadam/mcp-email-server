@@ -429,3 +429,110 @@ class TestDownloadAttachmentAllowlist:
                         allowed_senders=["*@example.com"],
                     )
         assert result["attachment_name"] == "document.pdf"
+
+
+class TestAttachmentMimeCorrectness:
+    """Regression tests for the MIME maintype/subtype fix.
+
+    Pre-fix, _create_attachment_part used MIMEApplication(_subtype=mime_type.split("/")[1])
+    which mangled every non-application type into application/<subtype>:
+    image/png shipped as application/png, text/plain as application/plain, etc.
+
+    The refactor routes through _ResolvedAttachment(maintype, subtype) and
+    builds parts with MIMEBase(maintype, subtype), so the Content-Type
+    header now reflects the real MIME type.
+    """
+
+    @pytest.mark.asyncio
+    async def test_png_attachment_keeps_image_maintype(self, email_client, tmp_path):
+        """An attachment with .png extension must ship as image/png, not application/png."""
+        import asyncio
+
+        # Real PNG signature + minimal IHDR + IEND so mimetypes.guess_type
+        # returns image/png from the .png extension regardless of contents.
+        png_path = tmp_path / "diagram.png"
+        png_path.write_bytes(
+            b"\x89PNG\r\n\x1a\n" + b"\x00" * 32  # not a parseable PNG, but mimetypes only looks at the extension
+        )
+
+        mock_smtp = AsyncMock()
+        mock_smtp.__aenter__.return_value = mock_smtp
+        mock_smtp.__aexit__.return_value = None
+        mock_smtp.login = AsyncMock()
+        mock_smtp.send_message = AsyncMock()
+
+        with patch("aiosmtplib.SMTP", return_value=mock_smtp):
+            await email_client.send_email(
+                recipients=["recipient@example.com"],
+                subject="png test",
+                body="see attached",
+                attachments=[str(png_path)],
+            )
+
+        # Inspect the actually-sent MIMEMultipart.
+        sent_msg = mock_smtp.send_message.call_args[0][0]
+        attachment_parts = [
+            p for p in sent_msg.walk() if str(p.get("Content-Disposition", "")).startswith("attachment")
+        ]
+        assert len(attachment_parts) == 1
+        # The load-bearing assertion: Content-Type stays image/png.
+        assert attachment_parts[0].get_content_type() == "image/png"
+        # And the filename is preserved.
+        assert attachment_parts[0].get_filename() == "diagram.png"
+
+        # Suppress unused-imports warning since we structurally need asyncio inside the patch context
+        _ = asyncio
+
+    @pytest.mark.asyncio
+    async def test_text_attachment_keeps_text_maintype(self, email_client, tmp_path):
+        """A .txt attachment must ship as text/plain, not application/plain."""
+        txt_path = tmp_path / "notes.txt"
+        txt_path.write_text("hello world")
+
+        mock_smtp = AsyncMock()
+        mock_smtp.__aenter__.return_value = mock_smtp
+        mock_smtp.__aexit__.return_value = None
+        mock_smtp.login = AsyncMock()
+        mock_smtp.send_message = AsyncMock()
+
+        with patch("aiosmtplib.SMTP", return_value=mock_smtp):
+            await email_client.send_email(
+                recipients=["recipient@example.com"],
+                subject="text test",
+                body="see attached",
+                attachments=[str(txt_path)],
+            )
+
+        sent_msg = mock_smtp.send_message.call_args[0][0]
+        attachment_parts = [
+            p for p in sent_msg.walk() if str(p.get("Content-Disposition", "")).startswith("attachment")
+        ]
+        assert len(attachment_parts) == 1
+        assert attachment_parts[0].get_content_type() == "text/plain"
+
+    @pytest.mark.asyncio
+    async def test_unknown_extension_defaults_to_octet_stream(self, email_client, tmp_path):
+        """An extension with no MIME mapping falls back to application/octet-stream."""
+        weird_path = tmp_path / "blob.whatever-extension"
+        weird_path.write_bytes(b"opaque bytes")
+
+        mock_smtp = AsyncMock()
+        mock_smtp.__aenter__.return_value = mock_smtp
+        mock_smtp.__aexit__.return_value = None
+        mock_smtp.login = AsyncMock()
+        mock_smtp.send_message = AsyncMock()
+
+        with patch("aiosmtplib.SMTP", return_value=mock_smtp):
+            await email_client.send_email(
+                recipients=["recipient@example.com"],
+                subject="weird test",
+                body="see attached",
+                attachments=[str(weird_path)],
+            )
+
+        sent_msg = mock_smtp.send_message.call_args[0][0]
+        attachment_parts = [
+            p for p in sent_msg.walk() if str(p.get("Content-Disposition", "")).startswith("attachment")
+        ]
+        assert len(attachment_parts) == 1
+        assert attachment_parts[0].get_content_type() == "application/octet-stream"
