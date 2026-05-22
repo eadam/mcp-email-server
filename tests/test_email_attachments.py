@@ -740,7 +740,7 @@ class TestInlineSendAttachments:
         cfg._settings = None
         try:
             with patch("aiosmtplib.SMTP", return_value=smtp_sink):
-                with pytest.raises(ValueError, match="aggregate size"):
+                with pytest.raises(ValueError, match=r"aggregate size would exceed cap"):
                     await email_client.send_email(
                         recipients=["r@example.com"],
                         subject="t",
@@ -752,6 +752,46 @@ class TestInlineSendAttachments:
                     )
         finally:
             cfg._settings = None
+
+    @pytest.mark.asyncio
+    async def test_aggregate_cap_rejects_before_decoding_oversize_item(self, email_client, smtp_sink, monkeypatch):
+        """Aggregate-budget exhaustion rejects *before* the next attachment is decoded.
+
+        Without the pre-decode aggregate check, an attachment whose per-item
+        size is under the per-item cap but whose addition would overshoot the
+        aggregate budget would still be base64-decoded into memory before the
+        post-decode aggregate check fired — wasted allocation, weakens the
+        aggregate cap as a server-protection control. Asserting via a spy on
+        ``base64.b64decode`` that it is only called for the accepted items.
+        """
+        # per_item generous, aggregate tight: first 100 bytes fine, second
+        # would overshoot but fits per_item.
+        monkeypatch.setenv("MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES_PER_ITEM", "10000")
+        monkeypatch.setenv("MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES", "150")
+        import mcp_email_server.config as cfg
+        import mcp_email_server.emails.classic as classic_mod
+
+        cfg._settings = None
+        spy = MagicMock(side_effect=base64.b64decode)
+        try:
+            with patch.object(classic_mod.base64, "b64decode", spy):
+                with patch("aiosmtplib.SMTP", return_value=smtp_sink):
+                    with pytest.raises(ValueError, match=r"aggregate size would exceed cap"):
+                        await email_client.send_email(
+                            recipients=["r@example.com"],
+                            subject="t",
+                            body="t",
+                            inline_attachments=[
+                                _inline(b"x" * 100, "a.bin"),  # accepted
+                                _inline(b"x" * 100, "b.bin"),  # rejected pre-decode
+                            ],
+                        )
+        finally:
+            cfg._settings = None
+
+        # Exactly one b64decode call — for the accepted attachment. The
+        # rejected one's payload is never decoded.
+        assert spy.call_count == 1, f"expected exactly 1 b64decode call (for the accepted item); got {spy.call_count}"
 
     @pytest.mark.asyncio
     async def test_explicit_mime_type_override(self, email_client, smtp_sink):

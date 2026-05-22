@@ -1062,16 +1062,27 @@ class EmailClient:
 
         running_total = 0
         for idx, item in enumerate(inline_attachments):
+            # Pre-decode aggregate check — refuse to allocate the next decode
+            # buffer if the encoded-length estimate would already overshoot the
+            # remaining aggregate budget. Without this, a 14 MiB attachment
+            # against a 5 MiB remaining budget would still get fully decoded
+            # (per-item cap satisfied) before the post-decode aggregate check
+            # rejected it. _decoded_base64_length is exact for clean base64
+            # (whitespace is rejected by validate=True in the resolver), so
+            # the estimate matches the post-decode size for any accepted input.
+            estimated = _decoded_base64_length(item.content_base64)
+            if running_total + estimated > aggregate:
+                raise ValueError(
+                    f"inline_attachments[{idx}]: aggregate size would exceed cap {aggregate} bytes "
+                    f"({running_total} already accepted, this attachment is ~{estimated} bytes by "
+                    f"encoded-length estimate). Raise MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES "
+                    f"or remove attachments."
+                )
             try:
                 rendered = _resolve_inline_attachment(item, per_item)
             except ValueError as e:
                 raise ValueError(f"inline_attachments[{idx}]: {e}") from None
             running_total += len(rendered.data)
-            if running_total > aggregate:
-                raise ValueError(
-                    f"inline_attachments aggregate size {running_total} bytes exceeds cap {aggregate}. "
-                    f"Raise MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES or remove attachments."
-                )
             resolved.append(rendered)
         return resolved
 
