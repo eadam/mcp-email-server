@@ -1,11 +1,13 @@
 """Test email attachment functionality."""
 
-from unittest.mock import AsyncMock, patch
+import base64
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from mcp_email_server.config import EmailServer
 from mcp_email_server.emails.classic import EmailClient
+from mcp_email_server.emails.models import InlineAttachment
 
 
 @pytest.fixture
@@ -298,3 +300,672 @@ class TestDownloadAttachmentMailboxParam:
 
                 # Verify select was called with quoted special folder
                 mock_imap.select.assert_called_once_with('"[Gmail]/Sent Mail"')
+
+
+# ---- Sender-allowlist gate on download_attachment ----
+# Lands with commit #1 of the inline-attachments feature. Inline-mode cases
+# are appended below in commit #4 once download_attachment_inline exists.
+
+RAW_EMAIL_FROM_BLOCKED = (
+    b"From: blocked@evil.example\r\n"
+    b"To: me@me.com\r\n"
+    b"Subject: hi\r\n"
+    b'Content-Type: multipart/mixed; boundary="b"\r\n'
+    b"\r\n"
+    b"--b\r\n"
+    b"Content-Type: text/plain\r\n"
+    b"\r\n"
+    b"body\r\n"
+    b"--b\r\n"
+    b"Content-Type: application/pdf\r\n"
+    b'Content-Disposition: attachment; filename="document.pdf"\r\n'
+    b"Content-Transfer-Encoding: base64\r\n"
+    b"\r\n"
+    b"JVBERi0K\r\n"
+    b"--b--\r\n"
+)
+
+RAW_EMAIL_FROM_ALLOWED = RAW_EMAIL_FROM_BLOCKED.replace(b"From: blocked@evil.example", b"From: alice@example.com")
+
+
+def _imap_mock():
+    import asyncio
+
+    mock_imap = AsyncMock()
+    mock_imap._client_task = asyncio.Future()
+    mock_imap._client_task.set_result(None)
+    mock_imap.wait_hello_from_server = AsyncMock()
+    mock_imap.login = AsyncMock()
+    mock_imap.select = AsyncMock(return_value=("OK", [b"1"]))
+    mock_imap.logout = AsyncMock()
+    return mock_imap
+
+
+class TestDownloadAttachmentAllowlist:
+    """Sender-allowlist enforcement on the EmailClient.download_attachment path.
+
+    The check happens against the From header of the already-fetched parsed
+    message — one IMAP fetch per call, not two.
+    """
+
+    @pytest.mark.asyncio
+    async def test_blocked_sender_raises_with_stable_message(self, email_client, tmp_path):
+        save_path = str(tmp_path / "attachment.pdf")
+        mock_imap = _imap_mock()
+        with patch.object(email_client, "_fetch_email_with_formats", AsyncMock(return_value=b"dummy")) as mock_fetch:
+            with patch.object(email_client, "_extract_raw_email", return_value=RAW_EMAIL_FROM_BLOCKED):
+                with patch.object(email_client, "imap_class", return_value=mock_imap):
+                    with pytest.raises(ValueError, match=r"^Attachment download blocked:"):
+                        await email_client.download_attachment(
+                            email_id="1",
+                            attachment_name="document.pdf",
+                            save_path=save_path,
+                            allowed_senders=["alice@example.com"],
+                        )
+            # Exactly one IMAP fetch — proves the gate doesn't introduce a
+            # separate header-only round-trip.
+            assert mock_fetch.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_blocked_sender_error_does_not_leak_attachment_bytes(self, email_client, tmp_path):
+        """Per logging-discipline rule: error message must not contain attachment payload."""
+        save_path = str(tmp_path / "attachment.pdf")
+        mock_imap = _imap_mock()
+        with patch.object(email_client, "_fetch_email_with_formats", AsyncMock(return_value=b"dummy")):
+            with patch.object(email_client, "_extract_raw_email", return_value=RAW_EMAIL_FROM_BLOCKED):
+                with patch.object(email_client, "imap_class", return_value=mock_imap):
+                    with pytest.raises(ValueError) as exc_info:
+                        await email_client.download_attachment(
+                            email_id="1",
+                            attachment_name="document.pdf",
+                            save_path=save_path,
+                            allowed_senders=["alice@example.com"],
+                        )
+        # The base64 payload "JVBERi0K" must not appear in any error text.
+        assert "JVBERi0K" not in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_allowed_sender_succeeds(self, email_client, tmp_path):
+        save_path = str(tmp_path / "attachment.pdf")
+        mock_imap = _imap_mock()
+        with patch.object(email_client, "_fetch_email_with_formats", AsyncMock(return_value=b"dummy")) as mock_fetch:
+            with patch.object(email_client, "_extract_raw_email", return_value=RAW_EMAIL_FROM_ALLOWED):
+                with patch.object(email_client, "imap_class", return_value=mock_imap):
+                    result = await email_client.download_attachment(
+                        email_id="1",
+                        attachment_name="document.pdf",
+                        save_path=save_path,
+                        allowed_senders=["alice@example.com"],
+                    )
+        assert result["attachment_name"] == "document.pdf"
+        assert mock_fetch.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_no_allowlist_skips_sender_check(self, email_client, tmp_path):
+        """Empty / None allowed_senders means no per-message check; previously-blocked sender now passes."""
+        save_path = str(tmp_path / "attachment.pdf")
+        mock_imap = _imap_mock()
+        with patch.object(email_client, "_fetch_email_with_formats", AsyncMock(return_value=b"dummy")):
+            with patch.object(email_client, "_extract_raw_email", return_value=RAW_EMAIL_FROM_BLOCKED):
+                with patch.object(email_client, "imap_class", return_value=mock_imap):
+                    # allowed_senders=None — equivalent to no allowlist configured
+                    result = await email_client.download_attachment(
+                        email_id="1",
+                        attachment_name="document.pdf",
+                        save_path=save_path,
+                        allowed_senders=None,
+                    )
+        assert result["attachment_name"] == "document.pdf"
+
+    @pytest.mark.asyncio
+    async def test_glob_pattern_matches(self, email_client, tmp_path):
+        save_path = str(tmp_path / "attachment.pdf")
+        mock_imap = _imap_mock()
+        with patch.object(email_client, "_fetch_email_with_formats", AsyncMock(return_value=b"dummy")):
+            with patch.object(email_client, "_extract_raw_email", return_value=RAW_EMAIL_FROM_ALLOWED):
+                with patch.object(email_client, "imap_class", return_value=mock_imap):
+                    result = await email_client.download_attachment(
+                        email_id="1",
+                        attachment_name="document.pdf",
+                        save_path=save_path,
+                        allowed_senders=["*@example.com"],
+                    )
+        assert result["attachment_name"] == "document.pdf"
+
+
+class TestAttachmentMimeCorrectness:
+    """Regression tests for the MIME maintype/subtype fix.
+
+    Pre-fix, _create_attachment_part used MIMEApplication(_subtype=mime_type.split("/")[1])
+    which mangled every non-application type into application/<subtype>:
+    image/png shipped as application/png, text/plain as application/plain, etc.
+
+    The refactor routes through _ResolvedAttachment(maintype, subtype) and
+    builds parts with MIMEBase(maintype, subtype), so the Content-Type
+    header now reflects the real MIME type.
+    """
+
+    @pytest.mark.asyncio
+    async def test_png_attachment_keeps_image_maintype(self, email_client, tmp_path):
+        """An attachment with .png extension must ship as image/png, not application/png."""
+        import asyncio
+
+        # Real PNG signature + minimal IHDR + IEND so mimetypes.guess_type
+        # returns image/png from the .png extension regardless of contents.
+        png_path = tmp_path / "diagram.png"
+        png_path.write_bytes(
+            b"\x89PNG\r\n\x1a\n" + b"\x00" * 32  # not a parseable PNG, but mimetypes only looks at the extension
+        )
+
+        mock_smtp = AsyncMock()
+        mock_smtp.__aenter__.return_value = mock_smtp
+        mock_smtp.__aexit__.return_value = None
+        mock_smtp.login = AsyncMock()
+        mock_smtp.send_message = AsyncMock()
+
+        with patch("aiosmtplib.SMTP", return_value=mock_smtp):
+            await email_client.send_email(
+                recipients=["recipient@example.com"],
+                subject="png test",
+                body="see attached",
+                attachments=[str(png_path)],
+            )
+
+        # Inspect the actually-sent MIMEMultipart.
+        sent_msg = mock_smtp.send_message.call_args[0][0]
+        attachment_parts = [
+            p for p in sent_msg.walk() if str(p.get("Content-Disposition", "")).startswith("attachment")
+        ]
+        assert len(attachment_parts) == 1
+        # The load-bearing assertion: Content-Type stays image/png.
+        assert attachment_parts[0].get_content_type() == "image/png"
+        # And the filename is preserved.
+        assert attachment_parts[0].get_filename() == "diagram.png"
+
+        # Suppress unused-imports warning since we structurally need asyncio inside the patch context
+        _ = asyncio
+
+    @pytest.mark.asyncio
+    async def test_text_attachment_keeps_text_maintype(self, email_client, tmp_path):
+        """A .txt attachment must ship as text/plain, not application/plain."""
+        txt_path = tmp_path / "notes.txt"
+        txt_path.write_text("hello world")
+
+        mock_smtp = AsyncMock()
+        mock_smtp.__aenter__.return_value = mock_smtp
+        mock_smtp.__aexit__.return_value = None
+        mock_smtp.login = AsyncMock()
+        mock_smtp.send_message = AsyncMock()
+
+        with patch("aiosmtplib.SMTP", return_value=mock_smtp):
+            await email_client.send_email(
+                recipients=["recipient@example.com"],
+                subject="text test",
+                body="see attached",
+                attachments=[str(txt_path)],
+            )
+
+        sent_msg = mock_smtp.send_message.call_args[0][0]
+        attachment_parts = [
+            p for p in sent_msg.walk() if str(p.get("Content-Disposition", "")).startswith("attachment")
+        ]
+        assert len(attachment_parts) == 1
+        assert attachment_parts[0].get_content_type() == "text/plain"
+
+    @pytest.mark.asyncio
+    async def test_unknown_extension_defaults_to_octet_stream(self, email_client, tmp_path):
+        """An extension with no MIME mapping falls back to application/octet-stream."""
+        weird_path = tmp_path / "blob.whatever-extension"
+        weird_path.write_bytes(b"opaque bytes")
+
+        mock_smtp = AsyncMock()
+        mock_smtp.__aenter__.return_value = mock_smtp
+        mock_smtp.__aexit__.return_value = None
+        mock_smtp.login = AsyncMock()
+        mock_smtp.send_message = AsyncMock()
+
+        with patch("aiosmtplib.SMTP", return_value=mock_smtp):
+            await email_client.send_email(
+                recipients=["recipient@example.com"],
+                subject="weird test",
+                body="see attached",
+                attachments=[str(weird_path)],
+            )
+
+        sent_msg = mock_smtp.send_message.call_args[0][0]
+        attachment_parts = [
+            p for p in sent_msg.walk() if str(p.get("Content-Disposition", "")).startswith("attachment")
+        ]
+        assert len(attachment_parts) == 1
+        assert attachment_parts[0].get_content_type() == "application/octet-stream"
+
+
+# ---- Inline attachments on send_email and save_to_mailbox ----
+# Lands with commit #3 of the inline-attachments feature.
+
+
+def _inline(content: bytes, filename: str = "doc.bin", mime_type: str | None = None) -> InlineAttachment:
+    return InlineAttachment(
+        filename=filename,
+        content_base64=base64.b64encode(content).decode("ascii"),
+        mime_type=mime_type,
+    )
+
+
+@pytest.fixture
+def smtp_sink():
+    """A mock aiosmtplib.SMTP that captures the sent message."""
+    smtp = AsyncMock()
+    smtp.__aenter__.return_value = smtp
+    smtp.__aexit__.return_value = None
+    smtp.login = AsyncMock()
+    smtp.send_message = AsyncMock()
+    return smtp
+
+
+class TestInlineSendAttachments:
+    @pytest.mark.asyncio
+    async def test_single_inline_attachment_roundtrip(self, email_client, smtp_sink):
+        content = b"hello, attachments"
+        with patch("aiosmtplib.SMTP", return_value=smtp_sink):
+            await email_client.send_email(
+                recipients=["r@example.com"],
+                subject="inline test",
+                body="see attached",
+                inline_attachments=[_inline(content, "hello.txt")],
+            )
+        sent = smtp_sink.send_message.call_args[0][0]
+        parts = [p for p in sent.walk() if str(p.get("Content-Disposition", "")).startswith("attachment")]
+        assert len(parts) == 1
+        assert parts[0].get_filename() == "hello.txt"
+        assert parts[0].get_content_type() == "text/plain"
+        # The base64-encoded payload of the MIME part round-trips back to the source bytes.
+        assert parts[0].get_payload(decode=True) == content
+
+    @pytest.mark.asyncio
+    async def test_multiple_inline_attachments(self, email_client, smtp_sink):
+        with patch("aiosmtplib.SMTP", return_value=smtp_sink):
+            await email_client.send_email(
+                recipients=["r@example.com"],
+                subject="multi",
+                body="see attached",
+                inline_attachments=[
+                    _inline(b"one", "a.txt"),
+                    _inline(b"two", "b.txt"),
+                    _inline(b"three", "c.txt"),
+                ],
+            )
+        sent = smtp_sink.send_message.call_args[0][0]
+        parts = [p for p in sent.walk() if str(p.get("Content-Disposition", "")).startswith("attachment")]
+        assert [p.get_filename() for p in parts] == ["a.txt", "b.txt", "c.txt"]
+
+    @pytest.mark.asyncio
+    async def test_mixed_inline_and_path_attachments(self, email_client, smtp_sink, tmp_path):
+        path = tmp_path / "from-disk.txt"
+        path.write_text("disk content")
+        with patch("aiosmtplib.SMTP", return_value=smtp_sink):
+            await email_client.send_email(
+                recipients=["r@example.com"],
+                subject="mixed",
+                body="see attached",
+                attachments=[str(path)],
+                inline_attachments=[_inline(b"inline content", "from-inline.txt")],
+            )
+        sent = smtp_sink.send_message.call_args[0][0]
+        parts = [p for p in sent.walk() if str(p.get("Content-Disposition", "")).startswith("attachment")]
+        assert [p.get_filename() for p in parts] == ["from-disk.txt", "from-inline.txt"]
+
+    @pytest.mark.asyncio
+    async def test_backward_compat_no_attachments(self, email_client, smtp_sink):
+        """Calling without either list still yields a non-multipart MIMEText."""
+        with patch("aiosmtplib.SMTP", return_value=smtp_sink):
+            await email_client.send_email(
+                recipients=["r@example.com"],
+                subject="plain",
+                body="just text",
+            )
+        sent = smtp_sink.send_message.call_args[0][0]
+        assert not sent.is_multipart()
+
+    @pytest.mark.asyncio
+    async def test_malformed_base64_rejected_with_safe_message(self, email_client, smtp_sink):
+        bad = InlineAttachment(filename="doc.txt", content_base64="not!valid!base64!", mime_type=None)
+        with patch("aiosmtplib.SMTP", return_value=smtp_sink):
+            with pytest.raises(ValueError, match=r"inline_attachments\[0\]:"):
+                await email_client.send_email(
+                    recipients=["r@example.com"],
+                    subject="bad",
+                    body="see attached",
+                    inline_attachments=[bad],
+                )
+        smtp_sink.send_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_empty_filename_rejected(self, email_client, smtp_sink):
+        bad = InlineAttachment(filename="", content_base64=base64.b64encode(b"x").decode(), mime_type=None)
+        with patch("aiosmtplib.SMTP", return_value=smtp_sink):
+            with pytest.raises(ValueError, match="empty"):
+                await email_client.send_email(
+                    recipients=["r@example.com"],
+                    subject="bad",
+                    body="see attached",
+                    inline_attachments=[bad],
+                )
+
+    @pytest.mark.asyncio
+    async def test_posix_path_traversal_normalized(self, email_client, smtp_sink):
+        """../etc/passwd → passwd (silent strip, not rejection)."""
+        attachment = _inline(b"x", "../etc/passwd")
+        with patch("aiosmtplib.SMTP", return_value=smtp_sink):
+            await email_client.send_email(
+                recipients=["r@example.com"],
+                subject="t",
+                body="t",
+                inline_attachments=[attachment],
+            )
+        sent = smtp_sink.send_message.call_args[0][0]
+        parts = [p for p in sent.walk() if str(p.get("Content-Disposition", "")).startswith("attachment")]
+        assert parts[0].get_filename() == "passwd"
+
+    @pytest.mark.asyncio
+    async def test_windows_path_traversal_normalized(self, email_client, smtp_sink):
+        """..\\..\\secret.txt → secret.txt."""
+        attachment = _inline(b"x", "..\\..\\secret.txt")
+        with patch("aiosmtplib.SMTP", return_value=smtp_sink):
+            await email_client.send_email(
+                recipients=["r@example.com"],
+                subject="t",
+                body="t",
+                inline_attachments=[attachment],
+            )
+        sent = smtp_sink.send_message.call_args[0][0]
+        parts = [p for p in sent.walk() if str(p.get("Content-Disposition", "")).startswith("attachment")]
+        assert parts[0].get_filename() == "secret.txt"
+
+    @pytest.mark.asyncio
+    async def test_filename_with_control_chars_rejected(self, email_client, smtp_sink):
+        attachment = _inline(b"x", "evil\x00.txt")
+        with patch("aiosmtplib.SMTP", return_value=smtp_sink):
+            with pytest.raises(ValueError, match="disallowed characters"):
+                await email_client.send_email(
+                    recipients=["r@example.com"],
+                    subject="t",
+                    body="t",
+                    inline_attachments=[attachment],
+                )
+
+    @pytest.mark.asyncio
+    async def test_filename_with_newline_rejected(self, email_client, smtp_sink):
+        attachment = _inline(b"x", "evil\nname.txt")
+        with patch("aiosmtplib.SMTP", return_value=smtp_sink):
+            with pytest.raises(ValueError, match="disallowed characters"):
+                await email_client.send_email(
+                    recipients=["r@example.com"],
+                    subject="t",
+                    body="t",
+                    inline_attachments=[attachment],
+                )
+
+    @pytest.mark.asyncio
+    async def test_per_item_cap_rejected_pre_decode(self, email_client, smtp_sink, monkeypatch):
+        """Oversize attachment is rejected from base64-length math BEFORE decoding."""
+        from mcp_email_server.config import _settings, get_settings
+
+        # Push a tiny per-item cap via env + settings reload.
+        monkeypatch.setenv("MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES_PER_ITEM", "100")
+        monkeypatch.setenv("MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES", "1000")
+        import mcp_email_server.config as cfg
+
+        cfg._settings = None  # force reload
+        try:
+            attachment = _inline(b"x" * 500, "big.bin")
+            with patch("aiosmtplib.SMTP", return_value=smtp_sink):
+                with pytest.raises(ValueError, match=r"inline_attachments\[0\]:.*too large"):
+                    await email_client.send_email(
+                        recipients=["r@example.com"],
+                        subject="t",
+                        body="t",
+                        inline_attachments=[attachment],
+                    )
+        finally:
+            cfg._settings = _settings  # restore
+            _ = get_settings()
+
+    @pytest.mark.asyncio
+    async def test_aggregate_cap_rejected(self, email_client, smtp_sink, monkeypatch):
+        monkeypatch.setenv("MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES_PER_ITEM", "1000")
+        monkeypatch.setenv("MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES", "150")
+        import mcp_email_server.config as cfg
+
+        cfg._settings = None
+        try:
+            with patch("aiosmtplib.SMTP", return_value=smtp_sink):
+                with pytest.raises(ValueError, match=r"aggregate size would exceed cap"):
+                    await email_client.send_email(
+                        recipients=["r@example.com"],
+                        subject="t",
+                        body="t",
+                        inline_attachments=[
+                            _inline(b"x" * 100, "a.bin"),
+                            _inline(b"x" * 100, "b.bin"),
+                        ],
+                    )
+        finally:
+            cfg._settings = None
+
+    @pytest.mark.asyncio
+    async def test_aggregate_cap_rejects_before_decoding_oversize_item(self, email_client, smtp_sink, monkeypatch):
+        """Aggregate-budget exhaustion rejects *before* the next attachment is decoded.
+
+        Without the pre-decode aggregate check, an attachment whose per-item
+        size is under the per-item cap but whose addition would overshoot the
+        aggregate budget would still be base64-decoded into memory before the
+        post-decode aggregate check fired — wasted allocation, weakens the
+        aggregate cap as a server-protection control. Asserting via a spy on
+        ``base64.b64decode`` that it is only called for the accepted items.
+        """
+        # per_item generous, aggregate tight: first 100 bytes fine, second
+        # would overshoot but fits per_item.
+        monkeypatch.setenv("MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES_PER_ITEM", "10000")
+        monkeypatch.setenv("MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES", "150")
+        import mcp_email_server.config as cfg
+        import mcp_email_server.emails.classic as classic_mod
+
+        cfg._settings = None
+        spy = MagicMock(side_effect=base64.b64decode)
+        try:
+            with patch.object(classic_mod.base64, "b64decode", spy):
+                with patch("aiosmtplib.SMTP", return_value=smtp_sink):
+                    with pytest.raises(ValueError, match=r"aggregate size would exceed cap"):
+                        await email_client.send_email(
+                            recipients=["r@example.com"],
+                            subject="t",
+                            body="t",
+                            inline_attachments=[
+                                _inline(b"x" * 100, "a.bin"),  # accepted
+                                _inline(b"x" * 100, "b.bin"),  # rejected pre-decode
+                            ],
+                        )
+        finally:
+            cfg._settings = None
+
+        # Exactly one b64decode call — for the accepted attachment. The
+        # rejected one's payload is never decoded.
+        assert spy.call_count == 1, f"expected exactly 1 b64decode call (for the accepted item); got {spy.call_count}"
+
+    @pytest.mark.asyncio
+    async def test_explicit_mime_type_override(self, email_client, smtp_sink):
+        attachment = _inline(b"opaque", "data.bin", mime_type="image/jpeg")
+        with patch("aiosmtplib.SMTP", return_value=smtp_sink):
+            await email_client.send_email(
+                recipients=["r@example.com"],
+                subject="t",
+                body="t",
+                inline_attachments=[attachment],
+            )
+        sent = smtp_sink.send_message.call_args[0][0]
+        parts = [p for p in sent.walk() if str(p.get("Content-Disposition", "")).startswith("attachment")]
+        assert parts[0].get_content_type() == "image/jpeg"
+
+    @pytest.mark.asyncio
+    async def test_malformed_mime_type_rejected(self, email_client, smtp_sink):
+        attachment = _inline(b"x", "f.bin", mime_type="not-a-mime-type")
+        with patch("aiosmtplib.SMTP", return_value=smtp_sink):
+            with pytest.raises(ValueError, match="Invalid MIME type"):
+                await email_client.send_email(
+                    recipients=["r@example.com"],
+                    subject="t",
+                    body="t",
+                    inline_attachments=[attachment],
+                )
+
+    @pytest.mark.asyncio
+    async def test_mime_type_with_parameters_rejected(self, email_client, smtp_sink):
+        attachment = _inline(b"x", "f.bin", mime_type="text/plain; charset=utf-8")
+        with patch("aiosmtplib.SMTP", return_value=smtp_sink):
+            with pytest.raises(ValueError, match="Invalid MIME type"):
+                await email_client.send_email(
+                    recipients=["r@example.com"],
+                    subject="t",
+                    body="t",
+                    inline_attachments=[attachment],
+                )
+
+    @pytest.mark.asyncio
+    async def test_error_messages_do_not_leak_base64(self, email_client, smtp_sink):
+        """Validation error text must not echo the content_base64 string."""
+        # A clearly identifiable base64 payload — if it shows up in an error, we leak.
+        secret_b64 = base64.b64encode(b"SUPER-SECRET-PAYLOAD-bytes" * 10).decode()
+        attachment = InlineAttachment(
+            filename="bad\x00name.txt",  # filename trips validation
+            content_base64=secret_b64,
+            mime_type=None,
+        )
+        with patch("aiosmtplib.SMTP", return_value=smtp_sink):
+            with pytest.raises(ValueError) as exc_info:
+                await email_client.send_email(
+                    recipients=["r@example.com"],
+                    subject="t",
+                    body="t",
+                    inline_attachments=[attachment],
+                )
+        assert secret_b64 not in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_save_to_mailbox_with_inline_attachments_uses_compose(self):
+        """save_to_mailbox routes inline_attachments through compose_message."""
+        from mcp_email_server.emails.classic import ClassicEmailHandler
+
+        # We don't run the IMAP APPEND — just verify the compose call shape.
+        handler = ClassicEmailHandler.__new__(ClassicEmailHandler)
+        handler.outgoing_client = MagicMock()
+        handler.outgoing_client.compose_message = MagicMock(return_value=MIMEMultipartSentinel())
+        handler.email_settings = MagicMock()
+        handler.outgoing_client.append_to_mailbox = AsyncMock(return_value="42")
+
+        attachment = _inline(b"x", "draft.txt")
+        await handler.save_to_mailbox(
+            recipients=["r@example.com"],
+            subject="d",
+            body="b",
+            inline_attachments=[attachment],
+        )
+        kwargs = handler.outgoing_client.compose_message.call_args.kwargs
+        assert kwargs["inline_attachments"] == [attachment]
+        assert kwargs["include_bcc_header"] is True
+
+
+class MIMEMultipartSentinel:
+    """Minimal stand-in supporting the __getitem__ Message-Id lookup in save_to_mailbox."""
+
+    def __getitem__(self, key):
+        return "<sentinel-message-id>"
+
+
+class TestPositionalCallRegression:
+    """Guard against silent re-mapping when ``inline_attachments`` was appended
+    to ``EmailClient.send_email`` / ``ClassicEmailHandler.send_email`` /
+    ``compose_message``. All touched call sites now use kwargs; this test makes
+    sure the by-position alternative still maps to the right slots end-to-end.
+    """
+
+    @pytest.mark.asyncio
+    async def test_send_email_with_threading_args(self, email_client, smtp_sink):
+        with patch("aiosmtplib.SMTP", return_value=smtp_sink):
+            await email_client.send_email(
+                ["r@example.com"],
+                "Re: hi",
+                "body",
+                None,
+                None,
+                False,
+                None,
+                "<thread-root@example.com>",
+                "<thread-root@example.com>",
+            )
+        sent = smtp_sink.send_message.call_args[0][0]
+        # If positional remap happened, threading headers would land in
+        # html-bool or attachments slot — and we'd see no In-Reply-To.
+        assert sent["In-Reply-To"] == "<thread-root@example.com>"
+        assert sent["References"] == "<thread-root@example.com>"
+
+
+class TestInlineDownloadAttachment:
+    """EmailClient.fetch_attachment_inline — handler-level behavior.
+
+    Lands with commit #4 of the inline-attachments feature.
+    """
+
+    @pytest.mark.asyncio
+    async def test_returns_content_base64(self, email_client):
+        mock_imap = _imap_mock()
+        with patch.object(email_client, "_fetch_email_with_formats", AsyncMock(return_value=b"dummy")):
+            with patch.object(email_client, "_extract_raw_email", return_value=RAW_EMAIL_FROM_ALLOWED):
+                with patch.object(email_client, "imap_class", return_value=mock_imap):
+                    result = await email_client.fetch_attachment_inline(
+                        email_id="1",
+                        attachment_name="document.pdf",
+                        max_bytes=1024 * 1024,
+                    )
+        assert "content_base64" in result
+        # The PDF content "JVBERi0K" was base64 in the source — decoding once
+        # gives the attachment bytes, decoding our returned content_base64
+        # gives those same bytes back.
+        decoded = base64.b64decode(result["content_base64"])
+        assert decoded == base64.b64decode(b"JVBERi0K")
+        assert result["mime_type"] == "application/pdf"
+        assert result["attachment_name"] == "document.pdf"
+        assert result["size"] == len(decoded)
+
+    @pytest.mark.asyncio
+    async def test_inline_oversize_rejected_with_stable_message(self, email_client):
+        mock_imap = _imap_mock()
+        with patch.object(email_client, "_fetch_email_with_formats", AsyncMock(return_value=b"dummy")):
+            with patch.object(email_client, "_extract_raw_email", return_value=RAW_EMAIL_FROM_ALLOWED):
+                with patch.object(email_client, "imap_class", return_value=mock_imap):
+                    # PDF payload is ~5 bytes decoded; cap=1 forces rejection.
+                    with pytest.raises(ValueError, match=r"^Attachment too large for inline mode") as exc_info:
+                        await email_client.fetch_attachment_inline(
+                            email_id="1",
+                            attachment_name="document.pdf",
+                            max_bytes=1,
+                        )
+        # Error message includes size and cap, and the actionable remediation
+        # hint pointing at the env var + the disk-write alternative.
+        assert "exceeds cap 1" in str(exc_info.value)
+        assert "MCP_EMAIL_SERVER_MAX_INLINE_DOWNLOAD_BYTES" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_inline_allowlist_blocks_before_extract(self, email_client):
+        """Sender allowlist enforcement applies to inline mode too."""
+        mock_imap = _imap_mock()
+        with patch.object(email_client, "_fetch_email_with_formats", AsyncMock(return_value=b"dummy")):
+            with patch.object(email_client, "_extract_raw_email", return_value=RAW_EMAIL_FROM_BLOCKED):
+                with patch.object(email_client, "imap_class", return_value=mock_imap):
+                    with pytest.raises(ValueError, match=r"^Attachment download blocked:"):
+                        await email_client.fetch_attachment_inline(
+                            email_id="1",
+                            attachment_name="document.pdf",
+                            allowed_senders=["alice@example.com"],
+                            max_bytes=1024 * 1024,
+                        )

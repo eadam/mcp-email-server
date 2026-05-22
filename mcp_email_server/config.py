@@ -27,6 +27,36 @@ def _parse_bool_env(value: str | None, default: bool = False) -> bool:
     return value.lower() in ("true", "1", "yes", "on")
 
 
+# Sanity ceiling on inline-attachment size envs — anything past 1 GiB is almost
+# certainly a typo. Settings that resolve over this fall back to default with a
+# logged warning rather than allocating gigabyte buffers.
+_INLINE_BYTES_CEILING = 1 * 1024 * 1024 * 1024
+
+
+def _parse_positive_int_env(name: str, default: int, max_allowed: int = _INLINE_BYTES_CEILING) -> int:
+    """Parse a positive-integer env var with bounds checking.
+
+    Returns ``default`` if the variable is unset, empty, non-numeric, ``<= 0``,
+    or above ``max_allowed``. In each unhappy case a warning is logged so the
+    operator sees that their override didn't take effect.
+    """
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(f"Ignoring {name}={raw!r}: not an integer; using default {default}")
+        return default
+    if value <= 0:
+        logger.warning(f"Ignoring {name}={value}: must be positive; using default {default}")
+        return default
+    if value > max_allowed:
+        logger.warning(f"Ignoring {name}={value}: exceeds ceiling {max_allowed}; using default {default}")
+        return default
+    return value
+
+
 CONFIG_PATH = Path(os.getenv("MCP_EMAIL_SERVER_CONFIG_PATH", DEFAULT_CONFIG_PATH)).expanduser().resolve()
 
 
@@ -243,6 +273,21 @@ class Settings(BaseSettings):
     # the human-review gate). Default False preserves upstream-compatible behavior.
     allowlist_required: bool = False
 
+    # Caps for inline-attachment send (commit #3 of the inline-attachments feature).
+    # Server protection, not iCloud deliverability guarantee — actual deliverability
+    # depends on the encoded message size after MIME wrapping. Defaults are
+    # conservative; override via MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES_PER_ITEM
+    # and MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES.
+    max_inline_attachment_bytes_per_item: int = 15 * 1024 * 1024
+    max_inline_attachment_bytes: int = 20 * 1024 * 1024
+
+    # Cap for download_attachment(inline=True) — the symmetric protection
+    # on the receive side. Override via MCP_EMAIL_SERVER_MAX_INLINE_DOWNLOAD_BYTES.
+    # Residual memory caveat: the IMAP fetch loads and parses the whole message
+    # before extracting the attachment, so this cap protects the MCP response
+    # wire payload but does not bound peak memory during fetch.
+    max_inline_download_bytes: int = 20 * 1024 * 1024
+
     model_config = SettingsConfigDict(
         toml_file=CONFIG_PATH, validate_assignment=True, revalidate_instances="always", extra="ignore"
     )
@@ -317,6 +362,22 @@ class Settings(BaseSettings):
         if env_required is not None:
             self.allowlist_required = _parse_bool_env(env_required, False)
             logger.info(f"Set allowlist_required={self.allowlist_required} from environment variable")
+
+        # Inline-attachment caps (commit #3 of the inline-attachments feature).
+        # _parse_positive_int_env handles "unset" by returning default unchanged,
+        # so unconditional reassignment is safe.
+        self.max_inline_attachment_bytes_per_item = _parse_positive_int_env(
+            "MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES_PER_ITEM",
+            self.max_inline_attachment_bytes_per_item,
+        )
+        self.max_inline_attachment_bytes = _parse_positive_int_env(
+            "MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES",
+            self.max_inline_attachment_bytes,
+        )
+        self.max_inline_download_bytes = _parse_positive_int_env(
+            "MCP_EMAIL_SERVER_MAX_INLINE_DOWNLOAD_BYTES",
+            self.max_inline_download_bytes,
+        )
 
     def add_email(self, email: EmailSettings) -> None:
         """Use re-assigned for validation to work."""

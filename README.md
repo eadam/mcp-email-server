@@ -63,27 +63,30 @@ You can also configure the email server using environment variables, which is pa
 
 #### Available Environment Variables
 
-| Variable                                      | Description                                                                                                                                | Default       | Required |
-| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------------- | -------- |
-| `MCP_EMAIL_SERVER_ACCOUNT_NAME`               | Account identifier                                                                                                                         | `"default"`   | No       |
-| `MCP_EMAIL_SERVER_FULL_NAME`                  | Display name                                                                                                                               | Email prefix  | No       |
-| `MCP_EMAIL_SERVER_EMAIL_ADDRESS`              | Email address                                                                                                                              | -             | Yes      |
-| `MCP_EMAIL_SERVER_USER_NAME`                  | Login username                                                                                                                             | Same as email | No       |
-| `MCP_EMAIL_SERVER_PASSWORD`                   | Email password                                                                                                                             | -             | Yes      |
-| `MCP_EMAIL_SERVER_IMAP_HOST`                  | IMAP server host                                                                                                                           | -             | Yes      |
-| `MCP_EMAIL_SERVER_IMAP_PORT`                  | IMAP server port                                                                                                                           | `993`         | No       |
-| `MCP_EMAIL_SERVER_IMAP_SSL`                   | Enable IMAP SSL                                                                                                                            | `true`        | No       |
-| `MCP_EMAIL_SERVER_IMAP_VERIFY_SSL`            | Verify IMAP SSL certificates (disable for self-signed)                                                                                     | `true`        | No       |
-| `MCP_EMAIL_SERVER_SMTP_HOST`                  | SMTP server host                                                                                                                           | -             | Yes      |
-| `MCP_EMAIL_SERVER_SMTP_PORT`                  | SMTP server port                                                                                                                           | `465`         | No       |
-| `MCP_EMAIL_SERVER_SMTP_SSL`                   | Enable SMTP SSL                                                                                                                            | `true`        | No       |
-| `MCP_EMAIL_SERVER_SMTP_START_SSL`             | Enable STARTTLS                                                                                                                            | `false`       | No       |
-| `MCP_EMAIL_SERVER_SMTP_VERIFY_SSL`            | Verify SSL certificates (disable for self-signed)                                                                                          | `true`        | No       |
-| `MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD` | Enable attachment download                                                                                                                 | `false`       | No       |
-| `MCP_EMAIL_SERVER_SAVE_TO_SENT`               | Save sent emails to IMAP Sent folder                                                                                                       | `true`        | No       |
-| `MCP_EMAIL_SERVER_SENT_FOLDER_NAME`           | Custom Sent folder name (auto-detect if not set)                                                                                           | -             | No       |
-| `MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS`         | Comma-separated list of permitted recipient addresses. Empty = allow all (default). Example: `alice@example.com,bob@example.com`           | -             | No       |
-| `MCP_EMAIL_SERVER_ALLOWED_SENDERS`            | Comma-separated list of permitted sender address patterns. Supports fnmatch wildcards (e.g. `*@example.com`). Empty = allow all (default). | -             | No       |
+| Variable                                                | Description                                                                                                                                | Default             | Required |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ------------------- | -------- |
+| `MCP_EMAIL_SERVER_ACCOUNT_NAME`                         | Account identifier                                                                                                                         | `"default"`         | No       |
+| `MCP_EMAIL_SERVER_FULL_NAME`                            | Display name                                                                                                                               | Email prefix        | No       |
+| `MCP_EMAIL_SERVER_EMAIL_ADDRESS`                        | Email address                                                                                                                              | -                   | Yes      |
+| `MCP_EMAIL_SERVER_USER_NAME`                            | Login username                                                                                                                             | Same as email       | No       |
+| `MCP_EMAIL_SERVER_PASSWORD`                             | Email password                                                                                                                             | -                   | Yes      |
+| `MCP_EMAIL_SERVER_IMAP_HOST`                            | IMAP server host                                                                                                                           | -                   | Yes      |
+| `MCP_EMAIL_SERVER_IMAP_PORT`                            | IMAP server port                                                                                                                           | `993`               | No       |
+| `MCP_EMAIL_SERVER_IMAP_SSL`                             | Enable IMAP SSL                                                                                                                            | `true`              | No       |
+| `MCP_EMAIL_SERVER_IMAP_VERIFY_SSL`                      | Verify IMAP SSL certificates (disable for self-signed)                                                                                     | `true`              | No       |
+| `MCP_EMAIL_SERVER_SMTP_HOST`                            | SMTP server host                                                                                                                           | -                   | Yes      |
+| `MCP_EMAIL_SERVER_SMTP_PORT`                            | SMTP server port                                                                                                                           | `465`               | No       |
+| `MCP_EMAIL_SERVER_SMTP_SSL`                             | Enable SMTP SSL                                                                                                                            | `true`              | No       |
+| `MCP_EMAIL_SERVER_SMTP_START_SSL`                       | Enable STARTTLS                                                                                                                            | `false`             | No       |
+| `MCP_EMAIL_SERVER_SMTP_VERIFY_SSL`                      | Verify SSL certificates (disable for self-signed)                                                                                          | `true`              | No       |
+| `MCP_EMAIL_SERVER_ENABLE_ATTACHMENT_DOWNLOAD`           | Enable attachment download                                                                                                                 | `false`             | No       |
+| `MCP_EMAIL_SERVER_SAVE_TO_SENT`                         | Save sent emails to IMAP Sent folder                                                                                                       | `true`              | No       |
+| `MCP_EMAIL_SERVER_SENT_FOLDER_NAME`                     | Custom Sent folder name (auto-detect if not set)                                                                                           | -                   | No       |
+| `MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS`                   | Comma-separated list of permitted recipient addresses. Empty = allow all (default). Example: `alice@example.com,bob@example.com`           | -                   | No       |
+| `MCP_EMAIL_SERVER_ALLOWED_SENDERS`                      | Comma-separated list of permitted sender address patterns. Supports fnmatch wildcards (e.g. `*@example.com`). Empty = allow all (default). | -                   | No       |
+| `MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES_PER_ITEM` | Per-item raw-byte cap on inline (base64) send attachments. Server protection, not a deliverability contract.                               | `15728640` (15 MiB) | No       |
+| `MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES`          | Aggregate raw-byte cap across all `inline_attachments` on a single send.                                                                   | `20971520` (20 MiB) | No       |
+| `MCP_EMAIL_SERVER_MAX_INLINE_DOWNLOAD_BYTES`            | Raw-byte cap on `download_attachment(inline=True)`. See "Inline attachment caveats" below.                                                 | `20971520` (20 MiB) | No       |
 
 > **Note:** Unknown keys in the TOML config file are silently ignored. This means typos,
 > keys from older versions, or settings from a different feature branch will not cause
@@ -120,7 +123,22 @@ enable_attachment_download = true
 # ... your email configuration
 ```
 
-Once enabled, you can use the `download_attachment` tool to save email attachments to a specified path.
+Once enabled, you can use the `download_attachment` tool to save email attachments to a specified path, or to receive them inline as base64 — see the next section.
+
+### Inline Attachments (Remote MCP Clients)
+
+Path-based attachment APIs assume the MCP client and server share a filesystem. That is rarely true in practice — remote MCP clients (Claude Desktop on a different machine, MCP Server Portals, network-deployed Claude clients) can hand the server a file path that doesn't exist inside the server's namespace. To support those clients, both directions of the attachment API have an inline (base64) mode.
+
+**Sending: `inline_attachments` parameter** on `send_email` and `save_to_mailbox`. Each item is `{filename, content_base64, mime_type?}`. Filenames are sanitized server-side (path separators stripped, control chars rejected); MIME type is auto-detected from the filename if omitted. Combines with any path-based `attachments` array. Defaults: 15 MiB per item, 20 MiB aggregate — override via the two `MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES*` envs.
+
+**Receiving: `inline: bool` parameter** on `download_attachment`. When True, the response carries `content_base64` and `saved_path` is `None`; when False (the default), behavior is unchanged. Default cap 20 MiB — override via `MCP_EMAIL_SERVER_MAX_INLINE_DOWNLOAD_BYTES`.
+
+**Inline attachment caveats — please read:**
+
+- **`enable_attachment_download` is an exfiltration gate.** With inline mode available, this flag controls whether attachment bytes can leave the server at all (whether via disk or wire), not just whether they're written to disk. Be deliberate about enabling it.
+- **`save_to_mailbox` is intentionally exempt from the recipient allowlist.** Drafts are the human-review gate; the recipient allowlist only applies to `send_email`. This means an LLM can compose a draft with inline attachments addressed to anyone — that's by design, but worth knowing.
+- **Inline download caps protect the wire payload, not peak memory.** The IMAP fetch loads and parses the full message before the attachment is extracted, so an attachment that exceeds `max_inline_download_bytes` is still fetched once before being rejected. Don't rely on the cap to bound peak memory pressure under attack — set sensible IMAP-side message size limits at the provider too.
+- **Stable error messages.** Validation errors include the offending `inline_attachments[N]` index but never the base64 payload or any decoded bytes.
 
 ### Saving Sent Emails to IMAP Sent Folder
 

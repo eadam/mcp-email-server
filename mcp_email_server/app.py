@@ -1,11 +1,11 @@
-import fnmatch
 from datetime import datetime
-from email import utils as email_utils
 from typing import Annotated, Literal
 
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
+from mcp_email_server.allowlist import normalize_addrs as _normalize_addrs
+from mcp_email_server.allowlist import sender_allowed as _sender_allowed
 from mcp_email_server.config import (
     AccountAttributes,
     EmailSettings,
@@ -18,43 +18,12 @@ from mcp_email_server.emails.models import (
     EmailContentBatchResponse,
     EmailMarkResponse,
     EmailMetadataPageResponse,
+    InlineAttachment,
     MailboxInfo,
 )
 from mcp_email_server.log import logger
 
 mcp = FastMCP("email")
-
-
-def _normalize_addrs(raw: list[str]) -> list[str]:
-    """Extract bare lower-cased email addresses from a list of recipient strings.
-
-    Strips display-name forms like 'Foo <bad@evil.example>' down to the angle-addr
-    component before allowlist comparison. Closes the display-name bypass where a
-    well-formed allowlist entry could be evaded by wrapping the real address in
-    a friendly display name.
-    """
-    normalized: list[str] = []
-    for name_addr in email_utils.getaddresses(raw):
-        addr = name_addr[1].strip().lower() if name_addr[1] else ""
-        if addr:
-            normalized.append(addr)
-    return normalized
-
-
-def _sender_allowed(sender: str, patterns: list[str]) -> bool:
-    """Return True if sender matches any pattern in the allowlist, or if the list is empty.
-
-    Handles 'Name <addr>' format via email.utils.parseaddr. Matching is case-insensitive.
-    Patterns support fnmatch globs (e.g. *@example.com).
-
-    Unparseable sender strings (malformed From headers) are treated as not allowed
-    when an allowlist is configured — the safe default for the threat model.
-    """
-    if not patterns:
-        return True
-    _, addr = email_utils.parseaddr(sender)  # handles "Name <addr>" and bare addresses
-    addr = (addr or sender).lower()  # fallback to raw string if parse fails
-    return any(fnmatch.fnmatch(addr, pattern.lower()) for pattern in patterns)
 
 
 @mcp.resource("email://{account_name}")
@@ -268,6 +237,18 @@ async def send_email(
             description="Space-separated Message-IDs for the thread chain. Usually includes in_reply_to plus ancestors.",
         ),
     ] = None,
+    inline_attachments: Annotated[
+        list[InlineAttachment] | None,
+        Field(
+            default=None,
+            description=(
+                "Attachments shipped as inline base64 bytes — use this when the LLM and the server "
+                "do not share a filesystem (i.e. always, for remote MCP clients). Each item is "
+                "{filename, content_base64, mime_type?}. Combined with any path-based `attachments`. "
+                "Per-item and aggregate caps configurable via MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES* envs."
+            ),
+        ),
+    ] = None,
 ) -> str:
     settings = get_settings()
     # homelab hardening: fail-closed if required mode is on and no recipient allowlist set.
@@ -292,18 +273,20 @@ async def send_email(
             )
     handler = dispatch_handler(account_name)
     await handler.send_email(
-        recipients,
-        subject,
-        body,
-        cc,
-        bcc,
-        html,
-        attachments,
-        in_reply_to,
-        references,
+        recipients=recipients,
+        subject=subject,
+        body=body,
+        cc=cc,
+        bcc=bcc,
+        html=html,
+        attachments=attachments,
+        in_reply_to=in_reply_to,
+        references=references,
+        inline_attachments=inline_attachments,
     )
     recipient_str = ", ".join(recipients)
-    attachment_info = f" with {len(attachments)} attachment(s)" if attachments else ""
+    total_attachments = len(attachments or []) + len(inline_attachments or [])
+    attachment_info = f" with {total_attachments} attachment(s)" if total_attachments else ""
     return f"Email sent successfully to {recipient_str}{attachment_info}"
 
 
@@ -364,20 +347,33 @@ async def save_to_mailbox(
             description=r"IMAP flags to set on the message. Defaults to ['\\Draft', '\\Seen']. Common flags: '\\Draft', '\\Seen', '\\Flagged'.",
         ),
     ] = None,
+    inline_attachments: Annotated[
+        list[InlineAttachment] | None,
+        Field(
+            default=None,
+            description=(
+                "Attachments shipped as inline base64 bytes — use this when the LLM and the server "
+                "do not share a filesystem. Each item is {filename, content_base64, mime_type?}. "
+                "Combined with any path-based `attachments`. save_to_mailbox is intentionally exempt "
+                "from the recipient allowlist — drafts are the human-review gate."
+            ),
+        ),
+    ] = None,
 ) -> str:
     handler = dispatch_handler(account_name)
     result = await handler.save_to_mailbox(
-        recipients,
-        subject,
-        body,
-        mailbox,
-        cc,
-        bcc,
-        html,
-        attachments,
-        in_reply_to,
-        references,
-        flags,
+        recipients=recipients,
+        subject=subject,
+        body=body,
+        mailbox=mailbox,
+        cc=cc,
+        bcc=bcc,
+        html=html,
+        attachments=attachments,
+        in_reply_to=in_reply_to,
+        references=references,
+        flags=flags,
+        inline_attachments=inline_attachments,
     )
     # result format: "<message-id>|uid:<imap-uid>"
     parts = result.split("|uid:")
@@ -505,7 +501,17 @@ async def mark_emails(
 
 
 @mcp.tool(
-    description="Download an email attachment and save it to the specified path. This feature must be explicitly enabled in settings (enable_attachment_download=true) due to security considerations.",
+    description=(
+        "Download an email attachment. Two modes:\n"
+        "- inline=False (default): save the bytes to ``save_path`` on the server's filesystem. "
+        "Only useful when the MCP client and server share a filesystem.\n"
+        "- inline=True: return the bytes as base64 in the response (``content_base64`` field). "
+        "Use this for remote MCP clients that cannot read the server's filesystem. "
+        "Aggregate-size capped by MCP_EMAIL_SERVER_MAX_INLINE_DOWNLOAD_BYTES.\n"
+        "Must be explicitly enabled (enable_attachment_download=true). The sender allowlist "
+        "is enforced on the email's From header in both modes — once this tool is enabled "
+        "it exfiltrates attachment bytes from the server, so allowlist enforcement matters."
+    ),
 )
 async def download_attachment(
     account_name: Annotated[str, Field(description="The name of the email account.")],
@@ -515,8 +521,27 @@ async def download_attachment(
     attachment_name: Annotated[
         str, Field(description="The name of the attachment to download (as shown in the attachments list).")
     ],
-    save_path: Annotated[str, Field(description="The absolute path where the attachment should be saved.")],
+    save_path: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description=(
+                "Absolute path where the attachment should be saved. Required when inline=False; "
+                "ignored (with a warning log) when inline=True."
+            ),
+        ),
+    ] = None,
     mailbox: Annotated[str, Field(description="The mailbox to search in (default: INBOX).")] = "INBOX",
+    inline: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "When True, return the attachment bytes inline as base64 in ``content_base64`` "
+                "rather than writing to ``save_path``. Use this for remote MCP clients."
+            ),
+        ),
+    ] = False,
 ) -> AttachmentDownloadResponse:
     settings = get_settings()
     if not settings.enable_attachment_download:
@@ -525,5 +550,47 @@ async def download_attachment(
         )
         raise PermissionError(msg)
 
+    # Argument validation up front. inline=True ignores save_path; inline=False requires it.
+    if inline and save_path is not None:
+        logger.warning(f"download_attachment(inline=True) called with save_path={save_path!r}; ignoring save_path.")
+    if not inline and not save_path:
+        raise ValueError(
+            "download_attachment requires save_path when inline=False. "
+            "Either provide save_path or pass inline=True to receive the bytes in the response."
+        )
+
+    # Fail-closed pre-check: don't even open IMAP if required-mode is on but
+    # no allowlist is configured. Mirrors the read-tool pattern.
+    allowed = settings.allowed_senders
+    if getattr(settings, "allowlist_required", False) is True and not allowed:
+        logger.warning("allowlist_block kind=attachment_download reason=required-mode-empty-allowlist")
+        raise ValueError(
+            "Sender allowlist is required (MCP_EMAIL_SERVER_ALLOWLIST_REQUIRED=true) "
+            "but allowed_senders is empty. Configure MCP_EMAIL_SERVER_ALLOWED_SENDERS."
+        )
+
     handler = dispatch_handler(account_name)
-    return await handler.download_attachment(email_id, attachment_name, save_path, mailbox)
+    try:
+        if inline:
+            return await handler.download_attachment_inline(
+                email_id,
+                attachment_name,
+                mailbox,
+                allowed_senders=allowed,
+                max_bytes=settings.max_inline_download_bytes,
+            )
+        return await handler.download_attachment(
+            email_id,
+            attachment_name,
+            save_path,
+            mailbox,
+            allowed_senders=allowed,
+        )
+    except ValueError as exc:
+        # Per-message allowlist block: handler raises with a stable
+        # "Attachment download blocked: sender ..." message. Convert to the
+        # standard structured log line then re-raise so the LLM sees the
+        # rejection.
+        if str(exc).startswith("Attachment download blocked:"):
+            logger.warning(f"allowlist_block kind=attachment_download email_id={email_id!r}")
+        raise

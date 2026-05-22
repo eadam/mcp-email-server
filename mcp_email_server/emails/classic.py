@@ -1,23 +1,27 @@
 import asyncio
+import base64
 import email.utils
 import mimetypes
 import re
 import ssl
 import time
+import unicodedata
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
+from email import encoders
 from email.header import Header
-from email.mime.application import MIMEApplication
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.parser import BytesParser
 from email.policy import default
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import aioimaplib
 import aiosmtplib
 
+from mcp_email_server.allowlist import sender_allowed
 from mcp_email_server.config import EmailServer, EmailSettings
 from mcp_email_server.emails import EmailHandler
 from mcp_email_server.emails.models import (
@@ -27,6 +31,7 @@ from mcp_email_server.emails.models import (
     EmailMarkResponse,
     EmailMetadata,
     EmailMetadataPageResponse,
+    InlineAttachment,
 )
 from mcp_email_server.log import logger
 
@@ -114,6 +119,147 @@ def _create_ssl_context(verify_ssl: bool) -> ssl.SSLContext | None:
 
 # Backwards-compatible alias
 _create_smtp_ssl_context = _create_ssl_context
+
+
+# RFC 2045 token chars (no parameters, no control chars). Conservative.
+_MIME_TYPE_TOKEN = re.compile(r"^[A-Za-z0-9!#$&^_.+-]+/[A-Za-z0-9!#$&^_.+-]+$")
+# Filename-disallowed characters under our conservative LLM-transport policy.
+# Strict because filenames are a display string only — users with weird names
+# can have the LLM rename. NUL, CR, LF, raw quote/semicolon, plus C0/C1 controls.
+_FILENAME_DISALLOWED = re.compile(r"[\x00-\x1f\x7f-\x9f\";]")
+
+
+def _sanitize_attachment_filename(raw: str) -> str:
+    """Reduce a caller-supplied filename to a safe display string.
+
+    Strips POSIX and Windows path separators (so ``../../etc/passwd`` becomes
+    ``passwd`` and ``..\\..\\secret.txt`` becomes ``secret.txt``), rejects empty
+    results, rejects ``"."`` and ``".."`` after stripping, rejects control
+    characters and the conservative ``"``/``;`` set, and applies NFC
+    normalization so attackers can't sneak past the comparison with mixed
+    composed/decomposed forms.
+
+    Raises:
+        ValueError: If the result would be empty, ``"."``, ``".."``, or
+            contains any disallowed character.
+    """
+    if not raw:
+        raise ValueError("Attachment filename is empty")
+    # Strip directory components from both separator conventions.
+    stripped = raw.replace("\\", "/").rsplit("/", 1)[-1]
+    if not stripped or stripped in (".", ".."):
+        raise ValueError(f"Attachment filename {raw!r} resolves to an empty / dotted basename")
+    normalized = unicodedata.normalize("NFC", stripped)
+    if _FILENAME_DISALLOWED.search(normalized):
+        raise ValueError(f"Attachment filename {raw!r} contains disallowed characters")
+    return normalized
+
+
+def _validate_mime_type(raw: str) -> tuple[str, str]:
+    """Validate a caller-supplied MIME type and return (maintype, subtype).
+
+    Strict RFC 2045 token only — no parameters, no whitespace, no control
+    characters. Anything looser is rejected so we don't ship a corrupt
+    Content-Type header.
+    """
+    if not _MIME_TYPE_TOKEN.match(raw):
+        raise ValueError(f"Invalid MIME type {raw!r}: expected 'type/subtype' RFC 2045 tokens")
+    maintype, _, subtype = raw.partition("/")
+    return maintype, subtype
+
+
+def _decoded_base64_length(encoded: str) -> int:
+    """Estimate the decoded byte length of a base64 string without decoding it."""
+    if not encoded:
+        return 0
+    padding = encoded[-2:].count("=")
+    return (len(encoded) * 3) // 4 - padding
+
+
+def _resolve_inline_attachment(item: InlineAttachment, max_per_item: int) -> "_ResolvedAttachment":
+    """Validate an InlineAttachment and return a _ResolvedAttachment.
+
+    Steps, in order:
+
+    1. Reject any whitespace in ``content_base64`` (standard base64 only —
+       documented contract). This also makes step 2 meaningful since
+       ``base64.b64decode(..., validate=True)`` rejects whitespace anyway.
+    2. Estimate the decoded length from the encoded length and reject before
+       allocating if it would exceed ``max_per_item``. The size check happens
+       pre-decode so an oversized payload never gets a second buffer.
+    3. Strict ``base64.b64decode(..., validate=True)``.
+    4. Sanitize the filename (see :py:func:`_sanitize_attachment_filename`).
+    5. Validate / auto-detect the MIME type.
+
+    Errors are bare ``ValueError`` with stable, content-free messages — they
+    never include the base64 string or any decoded bytes.
+    """
+    encoded = item.content_base64
+    if any(c.isspace() for c in encoded):
+        raise ValueError("Inline attachment base64 contains whitespace; standard base64 only (no newlines or spaces)")
+
+    estimated = _decoded_base64_length(encoded)
+    if estimated > max_per_item:
+        raise ValueError(
+            f"Inline attachment too large: {estimated} bytes (estimated from base64 length) "
+            f"exceeds per-item cap {max_per_item}. Raise MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES_PER_ITEM "
+            f"or split the file."
+        )
+
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except (ValueError, Exception) as e:
+        # binascii.Error subclasses ValueError on Python 3.10+, but keep the
+        # broader except for older environments. Message stays content-free.
+        raise ValueError(f"Inline attachment base64 decode failed: {type(e).__name__}") from None
+
+    if len(data) > max_per_item:
+        # Belt-and-braces: the encoded estimate is an upper bound, but in
+        # case padding rules ever drift, recheck after decode.
+        raise ValueError(f"Inline attachment too large: {len(data)} bytes exceeds per-item cap {max_per_item}.")
+
+    filename = _sanitize_attachment_filename(item.filename)
+
+    if item.mime_type is not None:
+        maintype, subtype = _validate_mime_type(item.mime_type)
+    else:
+        guessed, _ = mimetypes.guess_type(filename)
+        if guessed is None or "/" not in guessed:
+            guessed = "application/octet-stream"
+        maintype, _, subtype = guessed.partition("/")
+
+    return _ResolvedAttachment(filename=filename, data=data, maintype=maintype, subtype=subtype)
+
+
+class _ResolvedAttachment(NamedTuple):
+    """An attachment resolved to MIME-assembly-ready bytes.
+
+    Inputs to the send pipeline (file paths today; inline base64 in a
+    forthcoming commit) get normalized into this shape before being added
+    to a MIMEMultipart. Keeping ``maintype`` / ``subtype`` separate avoids
+    the historical bug where ``MIMEApplication(_subtype=mime_type.split("/")[1])``
+    converted every type into ``application/<subtype>`` — e.g. ``image/png``
+    silently shipped as ``application/png``.
+    """
+
+    filename: str
+    data: bytes
+    maintype: str
+    subtype: str
+
+
+class _FetchedAttachment(NamedTuple):
+    """An attachment extracted from a fetched IMAP message.
+
+    The ``filename`` field is the value pulled from the parsed MIME part
+    (already decoded by ``policy=default``), not the caller-supplied
+    attachment name — so the inline-download response shows the same
+    filename a mail client would.
+    """
+
+    data: bytes
+    mime_type: str
+    filename: str
 
 
 class EmailClient:
@@ -647,23 +793,58 @@ class EmailClient:
             except Exception as e:
                 logger.info(f"Error during logout: {e}")
 
-    async def download_attachment(
+    @staticmethod
+    def _find_attachment_part(email_message, attachment_name: str) -> _FetchedAttachment | None:
+        """Walk a parsed message and return the named attachment, or None.
+
+        Looks at every part with a ``Content-Disposition`` header that mentions
+        ``attachment`` and returns the first match by filename.
+        """
+        if not email_message.is_multipart():
+            return None
+        for part in email_message.walk():
+            content_disposition = str(part.get("Content-Disposition", ""))
+            if "attachment" not in content_disposition:
+                continue
+            filename = part.get_filename()
+            if filename != attachment_name:
+                continue
+            return _FetchedAttachment(
+                data=part.get_payload(decode=True),
+                mime_type=part.get_content_type(),
+                filename=filename,
+            )
+        return None
+
+    async def _fetch_attachment_bytes(
         self,
         email_id: str,
         attachment_name: str,
-        save_path: str,
         mailbox: str = "INBOX",
-    ) -> dict[str, Any]:
-        """Download a specific attachment from an email and save it to disk.
+        *,
+        allowed_senders: list[str] | None = None,
+    ) -> _FetchedAttachment:
+        """Fetch + parse the email, enforce the sender allowlist, extract the attachment.
+
+        Returns the raw bytes, MIME type, and the filename as the parsed MIME
+        part reports it (which may differ from ``attachment_name`` if encoded
+        headers normalize differently).
+
+        One IMAP round-trip total — the same fetch covers both the sender
+        check (against ``From``) and the attachment extraction.
 
         Args:
             email_id: The UID of the email containing the attachment.
             attachment_name: The filename of the attachment to download.
-            save_path: The local path where the attachment will be saved.
             mailbox: The mailbox to search in (default: "INBOX").
+            allowed_senders: Optional per-message allowlist; if non-empty,
+                the email's ``From`` header must match before extraction.
+                Fail-closed required-mode lives in the MCP tool layer.
 
-        Returns:
-            A dictionary with download result information.
+        Raises:
+            ValueError: If the sender is not in ``allowed_senders`` (stable
+                message prefix ``"Attachment download blocked:"``), or the
+                requested attachment cannot be located.
         """
         imap = self._imap_connect()
         try:
@@ -689,45 +870,117 @@ class EmailClient:
             parser = BytesParser(policy=default)
             email_message = parser.parsebytes(raw_email)
 
-            # Find the attachment
-            attachment_data = None
-            mime_type = None
+            # Sender allowlist enforcement — happens after parse so the
+            # already-fetched From header is reused; no extra IMAP round-trip.
+            if allowed_senders:
+                from_header = str(email_message.get("From", ""))
+                if not sender_allowed(from_header, allowed_senders):
+                    raise ValueError(
+                        f"Attachment download blocked: sender {from_header!r} is not in the configured allowlist."
+                    )
 
-            if email_message.is_multipart():
-                for part in email_message.walk():
-                    content_disposition = str(part.get("Content-Disposition", ""))
-                    if "attachment" in content_disposition:
-                        filename = part.get_filename()
-                        if filename == attachment_name:
-                            attachment_data = part.get_payload(decode=True)
-                            mime_type = part.get_content_type()
-                            break
-
-            if attachment_data is None:
+            found = self._find_attachment_part(email_message, attachment_name)
+            if found is None:
                 msg = f"Attachment '{attachment_name}' not found in email {email_id}"
                 logger.error(msg)
                 raise ValueError(msg)
 
-            # Save to disk
-            save_file = Path(save_path)
-            save_file.parent.mkdir(parents=True, exist_ok=True)
-            save_file.write_bytes(attachment_data)
-
-            logger.info(f"Attachment '{attachment_name}' saved to {save_path}")
-
-            return {
-                "email_id": email_id,
-                "attachment_name": attachment_name,
-                "mime_type": mime_type or "application/octet-stream",
-                "size": len(attachment_data),
-                "saved_path": str(save_file.resolve()),
-            }
+            return found
 
         finally:
             try:
                 await imap.logout()
             except Exception as e:
                 logger.info(f"Error during logout: {e}")
+
+    async def download_attachment(
+        self,
+        email_id: str,
+        attachment_name: str,
+        save_path: str,
+        mailbox: str = "INBOX",
+        *,
+        allowed_senders: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Download a specific attachment from an email and save it to disk.
+
+        Thin wrapper over :py:meth:`_fetch_attachment_bytes` that writes the
+        returned bytes to ``save_path``. The sender allowlist check and the
+        IMAP fetch / parse live in the underlying helper.
+
+        Args:
+            email_id: The UID of the email containing the attachment.
+            attachment_name: The filename of the attachment to download.
+            save_path: The local path where the attachment will be saved.
+            mailbox: The mailbox to search in (default: "INBOX").
+            allowed_senders: Optional per-message sender allowlist.
+
+        Returns:
+            A dictionary with download result information.
+        """
+        fetched = await self._fetch_attachment_bytes(
+            email_id,
+            attachment_name,
+            mailbox,
+            allowed_senders=allowed_senders,
+        )
+
+        save_file = Path(save_path)
+        save_file.parent.mkdir(parents=True, exist_ok=True)
+        save_file.write_bytes(fetched.data)
+        logger.info(f"Attachment '{fetched.filename}' saved to {save_path}")
+
+        return {
+            "email_id": email_id,
+            "attachment_name": attachment_name,
+            "mime_type": fetched.mime_type,
+            "size": len(fetched.data),
+            "saved_path": str(save_file.resolve()),
+        }
+
+    async def fetch_attachment_inline(
+        self,
+        email_id: str,
+        attachment_name: str,
+        mailbox: str = "INBOX",
+        *,
+        allowed_senders: list[str] | None = None,
+        max_bytes: int,
+    ) -> dict[str, Any]:
+        """Return an attachment as base64-encoded bytes in the MCP response.
+
+        Symmetric companion to :py:meth:`download_attachment` for remote MCP
+        clients that cannot read the server's filesystem. Same IMAP fetch and
+        sender allowlist enforcement as the disk-write path — the difference is
+        purely where the bytes go.
+
+        Raises:
+            ValueError: If the attachment is larger than ``max_bytes`` (stable
+                message includes size + cap + remediation hint), or any error
+                from :py:meth:`_fetch_attachment_bytes` (allowlist block, IMAP
+                fetch failure, attachment not found).
+        """
+        fetched = await self._fetch_attachment_bytes(
+            email_id,
+            attachment_name,
+            mailbox,
+            allowed_senders=allowed_senders,
+        )
+        if len(fetched.data) > max_bytes:
+            raise ValueError(
+                f"Attachment too large for inline mode: {len(fetched.data)} bytes exceeds cap {max_bytes}. "
+                f"Use inline=False with a writable save_path, or raise MCP_EMAIL_SERVER_MAX_INLINE_DOWNLOAD_BYTES."
+            )
+
+        encoded = base64.b64encode(fetched.data).decode("ascii")
+        logger.info(f"Attachment '{fetched.filename}' returned inline ({len(fetched.data)} bytes)")
+        return {
+            "email_id": email_id,
+            "attachment_name": fetched.filename,
+            "mime_type": fetched.mime_type,
+            "size": len(fetched.data),
+            "content_base64": encoded,
+        }
 
     def _validate_attachment(self, file_path: str) -> Path:
         """Validate attachment file path."""
@@ -744,39 +997,106 @@ class EmailClient:
 
         return path
 
-    def _create_attachment_part(self, path: Path) -> MIMEApplication:
-        """Create MIME attachment part from file."""
+    def _resolve_path_attachment(self, file_path: str) -> _ResolvedAttachment:
+        """Read a file path into a _ResolvedAttachment with correct maintype/subtype.
+
+        Replaces the old ``MIMEApplication(_subtype=mime_type.split("/")[1])``
+        flow, which mangled non-application MIME types (e.g. ``image/png``
+        became ``application/png``).
+        """
+        path = self._validate_attachment(file_path)
         with open(path, "rb") as f:
-            file_data = f.read()
+            data = f.read()
 
         mime_type, _ = mimetypes.guess_type(str(path))
-        if mime_type is None:
+        if mime_type is None or "/" not in mime_type:
             mime_type = "application/octet-stream"
+        maintype, _, subtype = mime_type.partition("/")
+        return _ResolvedAttachment(filename=path.name, data=data, maintype=maintype, subtype=subtype)
 
-        attachment_part = MIMEApplication(file_data, _subtype=mime_type.split("/")[1])
-        attachment_part.add_header(
-            "Content-Disposition",
-            "attachment",
-            filename=path.name,
-        )
-        logger.info(f"Attached file: {path.name} ({mime_type})")
-        return attachment_part
+    def _build_attachment_part(self, resolved: _ResolvedAttachment) -> MIMEBase:
+        """Build a MIMEBase part from a resolved attachment, preserving maintype/subtype.
 
-    def _create_message_with_attachments(self, body: str, html: bool, attachments: list[str]) -> MIMEMultipart:
-        """Create multipart message with attachments."""
+        Uses MIMEBase + encoders.encode_base64 rather than MIMEApplication so
+        that an ``image/png`` attachment actually has Content-Type ``image/png``.
+        """
+        part = MIMEBase(resolved.maintype, resolved.subtype)
+        part.set_payload(resolved.data)
+        encoders.encode_base64(part)
+        part.add_header("Content-Disposition", "attachment", filename=resolved.filename)
+        logger.info(f"Attached file: {resolved.filename} ({resolved.maintype}/{resolved.subtype})")
+        return part
+
+    def _resolve_attachments(
+        self,
+        path_attachments: list[str] | None,
+        inline_attachments: list[InlineAttachment] | None,
+    ) -> list[_ResolvedAttachment]:
+        """Normalize the two attachment-input shapes into a single resolved list.
+
+        Path-based attachments are validated and read first; inline attachments
+        are then decoded, capped, and appended. The per-item and aggregate caps
+        for the inline list are read from the live settings (so env overrides
+        take effect without restart). Errors are raised with stable messages
+        that never include the base64 payload.
+        """
+        resolved: list[_ResolvedAttachment] = []
+        if path_attachments:
+            for file_path in path_attachments:
+                try:
+                    resolved.append(self._resolve_path_attachment(file_path))
+                except Exception as e:
+                    logger.error(f"Failed to attach file {file_path}: {e}")
+                    raise
+        if not inline_attachments:
+            return resolved
+
+        # Deferred settings import keeps unit tests that exercise compose_message
+        # directly (without monkey-patching settings) on sane defaults. Production
+        # paths still see env-overridden values via get_settings().
+        from mcp_email_server.config import get_settings
+
+        settings = get_settings()
+        per_item = settings.max_inline_attachment_bytes_per_item
+        aggregate = settings.max_inline_attachment_bytes
+
+        running_total = 0
+        for idx, item in enumerate(inline_attachments):
+            # Pre-decode aggregate check — refuse to allocate the next decode
+            # buffer if the encoded-length estimate would already overshoot the
+            # remaining aggregate budget. Without this, a 14 MiB attachment
+            # against a 5 MiB remaining budget would still get fully decoded
+            # (per-item cap satisfied) before the post-decode aggregate check
+            # rejected it. _decoded_base64_length is exact for clean base64
+            # (whitespace is rejected by validate=True in the resolver), so
+            # the estimate matches the post-decode size for any accepted input.
+            estimated = _decoded_base64_length(item.content_base64)
+            if running_total + estimated > aggregate:
+                raise ValueError(
+                    f"inline_attachments[{idx}]: aggregate size would exceed cap {aggregate} bytes "
+                    f"({running_total} already accepted, this attachment is ~{estimated} bytes by "
+                    f"encoded-length estimate). Raise MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES "
+                    f"or remove attachments."
+                )
+            try:
+                rendered = _resolve_inline_attachment(item, per_item)
+            except ValueError as e:
+                raise ValueError(f"inline_attachments[{idx}]: {e}") from None
+            running_total += len(rendered.data)
+            resolved.append(rendered)
+        return resolved
+
+    def _create_message_with_attachments(
+        self, body: str, html: bool, attachments: list[_ResolvedAttachment]
+    ) -> MIMEMultipart:
+        """Create multipart message with already-resolved attachments."""
         msg = MIMEMultipart()
         content_type = "html" if html else "plain"
         text_part = MIMEText(body, content_type, "utf-8")
         msg.attach(text_part)
 
-        for file_path in attachments:
-            try:
-                path = self._validate_attachment(file_path)
-                attachment_part = self._create_attachment_part(path)
-                msg.attach(attachment_part)
-            except Exception as e:
-                logger.error(f"Failed to attach file {file_path}: {e}")
-                raise
+        for attachment in attachments:
+            msg.attach(self._build_attachment_part(attachment))
 
         return msg
 
@@ -792,11 +1112,22 @@ class EmailClient:
         in_reply_to: str | None = None,
         references: str | None = None,
         include_bcc_header: bool = False,
+        inline_attachments: list[InlineAttachment] | None = None,
     ) -> MIMEText | MIMEMultipart:
         """Compose an email message without sending it.
 
         Builds MIME structure, sets headers (Subject, From, To, Cc, Date,
         Message-Id, threading headers). Synchronous — no I/O.
+
+        Two attachment inputs that are concatenated server-side:
+
+        - ``attachments`` is a list of absolute paths on the server's
+          filesystem. Resolved via :py:meth:`_resolve_path_attachment`.
+        - ``inline_attachments`` is a list of
+          :py:class:`~mcp_email_server.emails.models.InlineAttachment` objects
+          carrying base64-encoded bytes. Resolved via
+          :py:func:`_resolve_inline_attachment` with the per-item and
+          aggregate caps from settings.
 
         When ``include_bcc_header`` is True (used for local IMAP storage such
         as Drafts or Sent copies), the Bcc header is included so mail clients
@@ -804,8 +1135,9 @@ class EmailClient:
         sending), the Bcc header is omitted — BCC recipients are delivered
         via the SMTP envelope only.
         """
-        if attachments:
-            msg = self._create_message_with_attachments(body, html, attachments)
+        resolved = self._resolve_attachments(attachments, inline_attachments)
+        if resolved:
+            msg = self._create_message_with_attachments(body, html, resolved)
         else:
             content_type = "html" if html else "plain"
             msg = MIMEText(body, content_type, "utf-8")
@@ -856,8 +1188,23 @@ class EmailClient:
         attachments: list[str] | None = None,
         in_reply_to: str | None = None,
         references: str | None = None,
+        inline_attachments: list[InlineAttachment] | None = None,
     ) -> MIMEText | MIMEMultipart:
-        msg = self.compose_message(recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references)
+        # Switched from positional to kwargs while threading inline_attachments
+        # through compose_message — see the inline-attachments plan, section
+        # "Positional-API compatibility".
+        msg = self.compose_message(
+            recipients=recipients,
+            subject=subject,
+            body=body,
+            cc=cc,
+            bcc=bcc,
+            html=html,
+            attachments=attachments,
+            in_reply_to=in_reply_to,
+            references=references,
+            inline_attachments=inline_attachments,
+        )
 
         async with aiosmtplib.SMTP(
             hostname=self.email_server.host,
@@ -1323,9 +1670,22 @@ class ClassicEmailHandler(EmailHandler):
         attachments: list[str] | None = None,
         in_reply_to: str | None = None,
         references: str | None = None,
+        inline_attachments: list[InlineAttachment] | None = None,
     ) -> None:
+        # Switched to kwargs at the same time inline_attachments was appended
+        # to the EmailClient.send_email signature — see plan §"Positional-API
+        # compatibility".
         msg = await self.outgoing_client.send_email(
-            recipients, subject, body, cc, bcc, html, attachments, in_reply_to, references
+            recipients=recipients,
+            subject=subject,
+            body=body,
+            cc=cc,
+            bcc=bcc,
+            html=html,
+            attachments=attachments,
+            in_reply_to=in_reply_to,
+            references=references,
+            inline_attachments=inline_attachments,
         )
 
         # Save to Sent folder if enabled
@@ -1357,6 +1717,7 @@ class ClassicEmailHandler(EmailHandler):
         in_reply_to: str | None = None,
         references: str | None = None,
         flags: list[str] | None = None,
+        inline_attachments: list[InlineAttachment] | None = None,
     ) -> str:
         """Compose and save an email to the specified IMAP mailbox.
 
@@ -1368,20 +1729,23 @@ class ClassicEmailHandler(EmailHandler):
             A string in the format ``<message-id>|uid:<uid>``.
 
         Raises:
-            ValueError: If any flag in *flags* is invalid per RFC 3501.
+            ValueError: If any flag in *flags* is invalid per RFC 3501, or if
+                any inline attachment fails validation.
             RuntimeError: If the IMAP APPEND operation fails.
         """
+        # Switched to kwargs while threading inline_attachments through.
         msg = self.outgoing_client.compose_message(
-            recipients,
-            subject,
-            body,
-            cc,
-            bcc,
-            html,
-            attachments,
-            in_reply_to,
-            references,
+            recipients=recipients,
+            subject=subject,
+            body=body,
+            cc=cc,
+            bcc=bcc,
+            html=html,
+            attachments=attachments,
+            in_reply_to=in_reply_to,
+            references=references,
             include_bcc_header=True,
+            inline_attachments=inline_attachments,
         )
 
         flags_str = r"(\Draft \Seen)" if flags is None else _validate_flags(flags)
@@ -1430,6 +1794,8 @@ class ClassicEmailHandler(EmailHandler):
         attachment_name: str,
         save_path: str,
         mailbox: str = "INBOX",
+        *,
+        allowed_senders: list[str] | None = None,
     ) -> AttachmentDownloadResponse:
         """Download an email attachment and save it to the specified path.
 
@@ -1438,15 +1804,52 @@ class ClassicEmailHandler(EmailHandler):
             attachment_name: The filename of the attachment to download.
             save_path: The local path where the attachment will be saved.
             mailbox: The mailbox to search in (default: "INBOX").
+            allowed_senders: Optional sender allowlist enforced before the
+                attachment is extracted. See ``EmailClient.download_attachment``.
 
         Returns:
             AttachmentDownloadResponse with download result information.
         """
-        result = await self.incoming_client.download_attachment(email_id, attachment_name, save_path, mailbox)
+        result = await self.incoming_client.download_attachment(
+            email_id,
+            attachment_name,
+            save_path,
+            mailbox,
+            allowed_senders=allowed_senders,
+        )
         return AttachmentDownloadResponse(
             email_id=result["email_id"],
             attachment_name=result["attachment_name"],
             mime_type=result["mime_type"],
             size=result["size"],
             saved_path=result["saved_path"],
+        )
+
+    async def download_attachment_inline(
+        self,
+        email_id: str,
+        attachment_name: str,
+        mailbox: str = "INBOX",
+        *,
+        allowed_senders: list[str] | None = None,
+        max_bytes: int,
+    ) -> AttachmentDownloadResponse:
+        """Download an email attachment as inline base64 bytes (no disk write).
+
+        Symmetric companion to :py:meth:`download_attachment` for remote MCP
+        clients that cannot read the server's filesystem.
+        """
+        result = await self.incoming_client.fetch_attachment_inline(
+            email_id,
+            attachment_name,
+            mailbox,
+            allowed_senders=allowed_senders,
+            max_bytes=max_bytes,
+        )
+        return AttachmentDownloadResponse(
+            email_id=result["email_id"],
+            attachment_name=result["attachment_name"],
+            mime_type=result["mime_type"],
+            size=result["size"],
+            content_base64=result["content_base64"],
         )
