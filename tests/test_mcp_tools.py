@@ -454,18 +454,20 @@ class TestMcpTools:
                 # Verify the return value
                 assert result == "Email sent successfully to recipient@example.com"
 
-                # Verify send_email was called correctly
+                # Verify send_email was called correctly. Kwargs spelled out
+                # explicitly so future signature additions fail loudly here too.
                 mock_handler.send_email.assert_called_once_with(
-                    ["recipient@example.com"],
-                    "Test Subject",
-                    "Test Body",
-                    ["cc@example.com"],
-                    ["bcc@example.com"],
-                    False,
-                    None,
-                    None,  # in_reply_to
-                    None,  # references
-                    None,  # reply_to
+                    recipients=["recipient@example.com"],
+                    subject="Test Subject",
+                    body="Test Body",
+                    cc=["cc@example.com"],
+                    bcc=["bcc@example.com"],
+                    html=False,
+                    attachments=None,
+                    in_reply_to=None,
+                    references=None,
+                    reply_to=None,
+                    inline_attachments=None,
                 )
 
     @pytest.mark.asyncio

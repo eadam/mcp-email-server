@@ -2,6 +2,8 @@
 
 import os
 
+import pytest
+
 from mcp_email_server.config import EmailSettings, Settings
 
 
@@ -525,3 +527,72 @@ def test_allowed_senders_empty_env_clears_toml(tmp_path, monkeypatch):
         assert config_module.get_settings(reload=True).allowed_senders == []
     finally:
         config_module._settings = None
+
+
+# ---- Inline-attachment cap env parsing (homelab fork) ----
+
+
+@pytest.fixture(autouse=True)
+def _reset_settings_cache():
+    """Keep the settings singleton from leaking monkeypatched caps between tests."""
+    import mcp_email_server.config as config_module
+
+    config_module._settings = None
+    yield
+    config_module._settings = None
+
+
+def _reload_settings():
+    import mcp_email_server.config as config_module
+
+    return config_module.get_settings(reload=True)
+
+
+def test_max_inline_per_item_default_when_unset(monkeypatch):
+    monkeypatch.delenv("MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES_PER_ITEM", raising=False)
+    s = _reload_settings()
+    assert s.max_inline_attachment_bytes_per_item == 15 * 1024 * 1024
+
+
+def test_max_inline_per_item_valid_override(monkeypatch):
+    monkeypatch.setenv("MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES_PER_ITEM", "5000000")
+    s = _reload_settings()
+    assert s.max_inline_attachment_bytes_per_item == 5_000_000
+
+
+def test_max_inline_aggregate_valid_override(monkeypatch):
+    monkeypatch.setenv("MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES", "12345678")
+    s = _reload_settings()
+    assert s.max_inline_attachment_bytes == 12_345_678
+
+
+def test_max_inline_negative_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES_PER_ITEM", "-1")
+    s = _reload_settings()
+    # Negative is rejected — default applies.
+    assert s.max_inline_attachment_bytes_per_item == 15 * 1024 * 1024
+
+
+def test_max_inline_zero_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES_PER_ITEM", "0")
+    s = _reload_settings()
+    assert s.max_inline_attachment_bytes_per_item == 15 * 1024 * 1024
+
+
+def test_max_inline_non_integer_falls_back(monkeypatch):
+    monkeypatch.setenv("MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES", "not-a-number")
+    s = _reload_settings()
+    assert s.max_inline_attachment_bytes == 20 * 1024 * 1024
+
+
+def test_max_inline_above_ceiling_falls_back(monkeypatch):
+    # Anything above 1 GiB hits the sanity ceiling.
+    monkeypatch.setenv("MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES", str(2 * 1024 * 1024 * 1024))
+    s = _reload_settings()
+    assert s.max_inline_attachment_bytes == 20 * 1024 * 1024
+
+
+def test_max_inline_empty_string_falls_back(monkeypatch):
+    monkeypatch.setenv("MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES_PER_ITEM", "")
+    s = _reload_settings()
+    assert s.max_inline_attachment_bytes_per_item == 15 * 1024 * 1024

@@ -7,6 +7,7 @@ if TYPE_CHECKING:
         AttachmentDownloadResponse,
         EmailContentBatchResponse,
         EmailMetadataPageResponse,
+        InlineAttachment,
         MailboxInfo,
     )
 
@@ -84,6 +85,7 @@ class EmailHandler(abc.ABC):
         in_reply_to: str | None = None,
         references: str | None = None,
         reply_to: str | None = None,
+        inline_attachments: "list[InlineAttachment] | None" = None,
     ) -> None:
         """
         Send email
@@ -95,10 +97,14 @@ class EmailHandler(abc.ABC):
             cc: List of CC email addresses.
             bcc: List of BCC email addresses.
             html: Whether to send as HTML (True) or plain text (False).
-            attachments: List of file paths to attach.
+            attachments: List of server-local file paths to attach. Only usable
+                when the MCP client and the server share a filesystem.
             in_reply_to: Message-ID of the email being replied to (for threading).
             references: Space-separated Message-IDs for the thread chain.
             reply_to: Address to set as Reply-To header (overrides From for replies).
+            inline_attachments: List of base64-encoded attachments shipped over
+                the MCP wire. Use this for remote MCP clients that can't put a
+                file on the server's filesystem.
         """
 
     @abc.abstractmethod
@@ -115,8 +121,13 @@ class EmailHandler(abc.ABC):
         in_reply_to: str | None = None,
         references: str | None = None,
         flags: list[str] | None = None,
+        inline_attachments: "list[InlineAttachment] | None" = None,
     ) -> str:
-        """Compose an email and save it to the specified IMAP folder via APPEND."""
+        """Compose an email and save it to the specified IMAP folder via APPEND.
+
+        See :py:meth:`send_email` for the ``attachments`` vs ``inline_attachments``
+        distinction.
+        """
 
     @abc.abstractmethod
     async def delete_emails(self, email_ids: list[str], mailbox: str = "INBOX") -> tuple[list[str], list[str]]:

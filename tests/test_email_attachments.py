@@ -1,5 +1,6 @@
 """Test email attachment functionality."""
 
+import base64
 import re
 import unicodedata
 from email import encoders
@@ -14,6 +15,7 @@ import pytest
 
 from mcp_email_server.config import EmailServer
 from mcp_email_server.emails.classic import EmailClient
+from mcp_email_server.emails.models import InlineAttachment
 
 
 @pytest.fixture
@@ -865,3 +867,355 @@ class TestAttachmentMimeCorrectness:
         attachment_parts = self._sent_attachment_parts(mock_smtp)
         assert len(attachment_parts) == 1
         assert attachment_parts[0].get_content_type() == "application/octet-stream"
+
+
+# ---- Inline (base64) attachments on send_email and save_to_mailbox ----
+
+
+def _inline(content: bytes, filename: str = "doc.bin", mime_type: str | None = None) -> InlineAttachment:
+    return InlineAttachment(
+        filename=filename,
+        content_base64=base64.b64encode(content).decode("ascii"),
+        mime_type=mime_type,
+    )
+
+
+@pytest.fixture
+def smtp_sink():
+    """A mock aiosmtplib.SMTP that captures the sent message."""
+    smtp = AsyncMock()
+    smtp.__aenter__ = AsyncMock(return_value=smtp)
+    smtp.__aexit__ = AsyncMock()
+    return smtp
+
+
+def _attachment_parts(sent_message):
+    return [p for p in sent_message.walk() if str(p.get("Content-Disposition", "")).startswith("attachment")]
+
+
+class TestInlineSendAttachments:
+    @pytest.mark.asyncio
+    async def test_single_inline_attachment_roundtrip(self, email_client, smtp_sink):
+        content = b"hello, attachments"
+        with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp_sink):
+            await email_client.send_email(
+                recipients=["r@example.com"],
+                subject="inline test",
+                body="see attached",
+                inline_attachments=[_inline(content, "hello.txt")],
+            )
+        parts = _attachment_parts(smtp_sink.send_message.call_args[0][0])
+        assert len(parts) == 1
+        assert parts[0].get_filename() == "hello.txt"
+        assert parts[0].get_content_type() == "text/plain"
+        # The base64-encoded payload of the MIME part round-trips back to the source bytes.
+        assert parts[0].get_payload(decode=True) == content
+
+    @pytest.mark.asyncio
+    async def test_multiple_inline_attachments(self, email_client, smtp_sink):
+        with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp_sink):
+            await email_client.send_email(
+                recipients=["r@example.com"],
+                subject="multi",
+                body="see attached",
+                inline_attachments=[
+                    _inline(b"one", "a.txt"),
+                    _inline(b"two", "b.txt"),
+                    _inline(b"three", "c.txt"),
+                ],
+            )
+        parts = _attachment_parts(smtp_sink.send_message.call_args[0][0])
+        assert [p.get_filename() for p in parts] == ["a.txt", "b.txt", "c.txt"]
+
+    @pytest.mark.asyncio
+    async def test_mixed_inline_and_path_attachments(self, email_client, smtp_sink, tmp_path):
+        path = tmp_path / "from-disk.txt"
+        path.write_text("disk content")
+        with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp_sink):
+            await email_client.send_email(
+                recipients=["r@example.com"],
+                subject="mixed",
+                body="see attached",
+                attachments=[str(path)],
+                inline_attachments=[_inline(b"inline content", "from-inline.txt")],
+            )
+        parts = _attachment_parts(smtp_sink.send_message.call_args[0][0])
+        assert [p.get_filename() for p in parts] == ["from-disk.txt", "from-inline.txt"]
+
+    @pytest.mark.asyncio
+    async def test_backward_compat_no_attachments(self, email_client, smtp_sink):
+        """Calling without either list still yields a non-multipart MIMEText."""
+        with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp_sink):
+            await email_client.send_email(
+                recipients=["r@example.com"],
+                subject="plain",
+                body="just text",
+            )
+        assert not smtp_sink.send_message.call_args[0][0].is_multipart()
+
+    @pytest.mark.asyncio
+    async def test_malformed_base64_rejected_with_safe_message(self, email_client, smtp_sink):
+        bad = InlineAttachment(filename="doc.txt", content_base64="not!valid!base64!", mime_type=None)
+        with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp_sink):
+            with pytest.raises(ValueError, match=r"inline_attachments\[0\]:"):
+                await email_client.send_email(
+                    recipients=["r@example.com"],
+                    subject="bad",
+                    body="see attached",
+                    inline_attachments=[bad],
+                )
+        smtp_sink.send_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_empty_filename_rejected(self, email_client, smtp_sink):
+        bad = InlineAttachment(filename="", content_base64=base64.b64encode(b"x").decode(), mime_type=None)
+        with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp_sink):
+            with pytest.raises(ValueError, match="empty"):
+                await email_client.send_email(
+                    recipients=["r@example.com"],
+                    subject="bad",
+                    body="see attached",
+                    inline_attachments=[bad],
+                )
+
+    @pytest.mark.asyncio
+    async def test_posix_path_traversal_normalized(self, email_client, smtp_sink):
+        """../etc/passwd -> passwd (silent strip, not rejection)."""
+        with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp_sink):
+            await email_client.send_email(
+                recipients=["r@example.com"],
+                subject="t",
+                body="t",
+                inline_attachments=[_inline(b"x", "../etc/passwd")],
+            )
+        parts = _attachment_parts(smtp_sink.send_message.call_args[0][0])
+        assert parts[0].get_filename() == "passwd"
+
+    @pytest.mark.asyncio
+    async def test_windows_path_traversal_normalized(self, email_client, smtp_sink):
+        """..\\..\\secret.txt -> secret.txt."""
+        with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp_sink):
+            await email_client.send_email(
+                recipients=["r@example.com"],
+                subject="t",
+                body="t",
+                inline_attachments=[_inline(b"x", "..\\..\\secret.txt")],
+            )
+        parts = _attachment_parts(smtp_sink.send_message.call_args[0][0])
+        assert parts[0].get_filename() == "secret.txt"
+
+    @pytest.mark.asyncio
+    async def test_filename_with_control_chars_rejected(self, email_client, smtp_sink):
+        with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp_sink):
+            with pytest.raises(ValueError, match="disallowed characters"):
+                await email_client.send_email(
+                    recipients=["r@example.com"],
+                    subject="t",
+                    body="t",
+                    inline_attachments=[_inline(b"x", "evil\x00.txt")],
+                )
+
+    @pytest.mark.asyncio
+    async def test_filename_with_newline_rejected(self, email_client, smtp_sink):
+        with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp_sink):
+            with pytest.raises(ValueError, match="disallowed characters"):
+                await email_client.send_email(
+                    recipients=["r@example.com"],
+                    subject="t",
+                    body="t",
+                    inline_attachments=[_inline(b"x", "evil\nname.txt")],
+                )
+
+    @pytest.mark.asyncio
+    async def test_per_item_cap_rejected_pre_decode(self, email_client, smtp_sink, monkeypatch):
+        """Oversize attachment is rejected from base64-length math BEFORE decoding."""
+        import mcp_email_server.config as cfg
+
+        monkeypatch.setenv("MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES_PER_ITEM", "100")
+        monkeypatch.setenv("MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES", "1000")
+        cfg._settings = None  # force reload with the tiny caps
+        try:
+            with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp_sink):
+                with pytest.raises(ValueError, match=r"inline_attachments\[0\]:.*too large"):
+                    await email_client.send_email(
+                        recipients=["r@example.com"],
+                        subject="t",
+                        body="t",
+                        inline_attachments=[_inline(b"x" * 500, "big.bin")],
+                    )
+        finally:
+            cfg._settings = None
+
+    @pytest.mark.asyncio
+    async def test_aggregate_cap_rejected(self, email_client, smtp_sink, monkeypatch):
+        import mcp_email_server.config as cfg
+
+        monkeypatch.setenv("MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES_PER_ITEM", "1000")
+        monkeypatch.setenv("MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES", "150")
+        cfg._settings = None
+        try:
+            with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp_sink):
+                with pytest.raises(ValueError, match=r"aggregate size would exceed cap"):
+                    await email_client.send_email(
+                        recipients=["r@example.com"],
+                        subject="t",
+                        body="t",
+                        inline_attachments=[
+                            _inline(b"x" * 100, "a.bin"),
+                            _inline(b"x" * 100, "b.bin"),
+                        ],
+                    )
+        finally:
+            cfg._settings = None
+
+    @pytest.mark.asyncio
+    async def test_aggregate_cap_rejects_before_decoding_oversize_item(self, email_client, smtp_sink, monkeypatch):
+        """Aggregate-budget exhaustion rejects *before* the next attachment is decoded.
+
+        Without the pre-decode aggregate check, an attachment whose per-item
+        size is under the per-item cap but whose addition would overshoot the
+        aggregate budget would still be base64-decoded into memory before the
+        post-decode aggregate check fired — wasted allocation, weakening the
+        aggregate cap as a server-protection control. Asserting via a spy on
+        ``base64.b64decode`` that it is only called for the accepted items.
+        """
+        import mcp_email_server.config as cfg
+        import mcp_email_server.emails.classic as classic_mod
+
+        # per_item generous, aggregate tight: first 100 bytes fine, second
+        # would overshoot but fits per_item.
+        monkeypatch.setenv("MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES_PER_ITEM", "10000")
+        monkeypatch.setenv("MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES", "150")
+        cfg._settings = None
+        spy = MagicMock(side_effect=base64.b64decode)
+        try:
+            with patch.object(classic_mod.base64, "b64decode", spy):
+                with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp_sink):
+                    with pytest.raises(ValueError, match=r"aggregate size would exceed cap"):
+                        await email_client.send_email(
+                            recipients=["r@example.com"],
+                            subject="t",
+                            body="t",
+                            inline_attachments=[
+                                _inline(b"x" * 100, "a.bin"),  # accepted
+                                _inline(b"x" * 100, "b.bin"),  # rejected pre-decode
+                            ],
+                        )
+        finally:
+            cfg._settings = None
+
+        # Exactly one b64decode call — for the accepted attachment. The
+        # rejected one's payload is never decoded.
+        assert spy.call_count == 1, f"expected exactly 1 b64decode call (for the accepted item); got {spy.call_count}"
+
+    @pytest.mark.asyncio
+    async def test_explicit_mime_type_override(self, email_client, smtp_sink):
+        with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp_sink):
+            await email_client.send_email(
+                recipients=["r@example.com"],
+                subject="t",
+                body="t",
+                inline_attachments=[_inline(b"opaque", "data.bin", mime_type="image/jpeg")],
+            )
+        parts = _attachment_parts(smtp_sink.send_message.call_args[0][0])
+        assert parts[0].get_content_type() == "image/jpeg"
+
+    @pytest.mark.asyncio
+    async def test_malformed_mime_type_rejected(self, email_client, smtp_sink):
+        with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp_sink):
+            with pytest.raises(ValueError, match="Invalid MIME type"):
+                await email_client.send_email(
+                    recipients=["r@example.com"],
+                    subject="t",
+                    body="t",
+                    inline_attachments=[_inline(b"x", "f.bin", mime_type="not-a-mime-type")],
+                )
+
+    @pytest.mark.asyncio
+    async def test_mime_type_with_parameters_rejected(self, email_client, smtp_sink):
+        with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp_sink):
+            with pytest.raises(ValueError, match="Invalid MIME type"):
+                await email_client.send_email(
+                    recipients=["r@example.com"],
+                    subject="t",
+                    body="t",
+                    inline_attachments=[_inline(b"x", "f.bin", mime_type="text/plain; charset=utf-8")],
+                )
+
+    @pytest.mark.asyncio
+    async def test_error_messages_do_not_leak_base64(self, email_client, smtp_sink):
+        """Validation error text must not echo the content_base64 string."""
+        # A clearly identifiable base64 payload — if it shows up in an error, we leak.
+        secret_b64 = base64.b64encode(b"SUPER-SECRET-PAYLOAD-bytes" * 10).decode()
+        attachment = InlineAttachment(
+            filename="bad\x00name.txt",  # filename trips validation
+            content_base64=secret_b64,
+            mime_type=None,
+        )
+        with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp_sink):
+            with pytest.raises(ValueError) as exc_info:
+                await email_client.send_email(
+                    recipients=["r@example.com"],
+                    subject="t",
+                    body="t",
+                    inline_attachments=[attachment],
+                )
+        assert secret_b64 not in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_save_to_mailbox_with_inline_attachments_uses_compose(self):
+        """save_to_mailbox routes inline_attachments through compose_message."""
+        from mcp_email_server.emails.classic import ClassicEmailHandler
+
+        # We don't run the IMAP APPEND — just verify the compose call shape.
+        handler = ClassicEmailHandler.__new__(ClassicEmailHandler)
+        handler.outgoing_client = MagicMock()
+        handler.outgoing_client.compose_message = MagicMock(return_value=MIMEMultipartSentinel())
+        handler.email_settings = MagicMock()
+        handler.outgoing_client.append_to_mailbox = AsyncMock(return_value="42")
+
+        attachment = _inline(b"x", "draft.txt")
+        await handler.save_to_mailbox(
+            recipients=["r@example.com"],
+            subject="d",
+            body="b",
+            inline_attachments=[attachment],
+        )
+        kwargs = handler.outgoing_client.compose_message.call_args.kwargs
+        assert kwargs["inline_attachments"] == [attachment]
+        assert kwargs["include_bcc_header"] is True
+
+
+class MIMEMultipartSentinel:
+    """Minimal stand-in supporting the __getitem__ Message-Id lookup in save_to_mailbox."""
+
+    def __getitem__(self, key):
+        return "<sentinel-message-id>"
+
+
+class TestPositionalCallRegression:
+    """Guard against silent re-mapping when ``inline_attachments`` was appended
+    to ``EmailClient.send_email`` / ``ClassicEmailHandler.send_email`` /
+    ``compose_message``. All touched call sites now use kwargs; this test makes
+    sure the by-position alternative still maps to the right slots end-to-end.
+    """
+
+    @pytest.mark.asyncio
+    async def test_send_email_with_threading_args(self, email_client, smtp_sink):
+        with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=smtp_sink):
+            await email_client.send_email(
+                ["r@example.com"],
+                "Re: hi",
+                "body",
+                None,
+                None,
+                False,
+                None,
+                "<thread-root@example.com>",
+                "<thread-root@example.com>",
+            )
+        sent = smtp_sink.send_message.call_args[0][0]
+        # If positional remap happened, threading headers would land in the
+        # html-bool or attachments slot — and we'd see no In-Reply-To.
+        assert sent["In-Reply-To"] == "<thread-root@example.com>"
+        assert sent["References"] == "<thread-root@example.com>"
