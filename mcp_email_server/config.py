@@ -369,6 +369,14 @@ class Settings(BaseSettings):
     max_inline_attachment_bytes_per_item: int = 15 * 1024 * 1024
     max_inline_attachment_bytes: int = 20 * 1024 * 1024
 
+    # Homelab fork: cap for download_attachment(inline=True) — the symmetric
+    # protection on the receive side. Override via
+    # MCP_EMAIL_SERVER_MAX_INLINE_DOWNLOAD_BYTES. Residual memory caveat: the
+    # IMAP fetch loads and parses the whole message before extracting the
+    # attachment, so this cap protects the MCP response wire payload but does
+    # not bound peak memory during fetch.
+    max_inline_download_bytes: int = 20 * 1024 * 1024
+
     model_config = SettingsConfigDict(toml_file=CONFIG_PATH, validate_assignment=True, revalidate_instances="always")
 
     @property
@@ -553,6 +561,10 @@ class Settings(BaseSettings):
         self.max_inline_attachment_bytes = _parse_positive_int_env(
             "MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES",
             self.max_inline_attachment_bytes,
+        )
+        self.max_inline_download_bytes = _parse_positive_int_env(
+            "MCP_EMAIL_SERVER_MAX_INLINE_DOWNLOAD_BYTES",
+            self.max_inline_download_bytes,
         )
 
     def add_email(self, email: EmailSettings) -> None:

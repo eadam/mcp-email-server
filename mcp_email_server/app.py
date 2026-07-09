@@ -22,6 +22,7 @@ from mcp_email_server.emails.models import (
     InlineAttachment,
     MailboxInfo,
 )
+from mcp_email_server.log import logger
 
 ToolVisibilityPredicate = Callable[[], bool]
 
@@ -549,7 +550,17 @@ async def list_mailboxes(
 
 
 @mcp.tool(
-    description="Download an email attachment and save it to the specified path. This feature must be explicitly enabled in settings (enable_attachment_download=true) due to security considerations.",
+    description=(
+        "Download an email attachment. Two modes:\n"
+        "- inline=False (default): save the bytes to `save_path` on the server's filesystem. "
+        "Only useful when the MCP client and server share a filesystem.\n"
+        "- inline=True: return the bytes as base64 in the response (`content_base64` field). "
+        "Use this for remote MCP clients that cannot read the server's filesystem. "
+        "Size-capped by MCP_EMAIL_SERVER_MAX_INLINE_DOWNLOAD_BYTES.\n"
+        "Must be explicitly enabled in settings (enable_attachment_download=true) due to security "
+        "considerations — once enabled, this tool exfiltrates attachment bytes from the server in "
+        "either mode, and the sender allowlist is enforced on the email's From header in both."
+    ),
 )
 async def download_attachment(
     account_name: Annotated[str, Field(description="The name of the email account.")],
@@ -559,8 +570,27 @@ async def download_attachment(
     attachment_name: Annotated[
         str, Field(description="The name of the attachment to download (as shown in the attachments list).")
     ],
-    save_path: Annotated[str, Field(description="The absolute path where the attachment should be saved.")],
+    save_path: Annotated[
+        str | None,
+        Field(
+            default=None,
+            description=(
+                "Absolute path where the attachment should be saved. Required when inline=False; "
+                "ignored (with a warning log) when inline=True."
+            ),
+        ),
+    ] = None,
     mailbox: Annotated[str, Field(description="The mailbox to search in (default: INBOX).")] = "INBOX",
+    inline: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "When True, return the attachment bytes inline as base64 in `content_base64` "
+                "rather than writing to `save_path`. Use this for remote MCP clients."
+            ),
+        ),
+    ] = False,
 ) -> AttachmentDownloadResponse:
     settings = get_settings()
     if not settings.enable_attachment_download:
@@ -569,5 +599,21 @@ async def download_attachment(
         )
         raise PermissionError(msg)
 
+    # Argument validation up front. inline=True ignores save_path; inline=False requires it.
+    if inline and save_path is not None:
+        logger.warning(f"download_attachment(inline=True) called with save_path={save_path!r}; ignoring save_path.")
+    if not inline and not save_path:
+        raise ValueError(
+            "download_attachment requires save_path when inline=False. "
+            "Either provide save_path or pass inline=True to receive the bytes in the response."
+        )
+
     handler = dispatch_handler(account_name)
+    if inline:
+        return await handler.download_attachment_inline(
+            email_id,
+            attachment_name,
+            mailbox,
+            max_bytes=settings.max_inline_download_bytes,
+        )
     return await handler.download_attachment(email_id, attachment_name, save_path, mailbox)
