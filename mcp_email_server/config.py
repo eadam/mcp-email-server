@@ -45,6 +45,36 @@ def _parse_bool_env(value: str | None, default: bool = False) -> bool:
     return value.lower() in ("true", "1", "yes", "on")
 
 
+# Sanity ceiling on inline-attachment size envs — anything past 1 GiB is almost
+# certainly a typo. Settings that resolve over this fall back to default with a
+# logged warning rather than allocating gigabyte buffers.
+_INLINE_BYTES_CEILING = 1 * 1024 * 1024 * 1024
+
+
+def _parse_positive_int_env(name: str, default: int, max_allowed: int = _INLINE_BYTES_CEILING) -> int:
+    """Parse a positive-integer env var with bounds checking.
+
+    Returns ``default`` if the variable is unset, empty, non-numeric, ``<= 0``,
+    or above ``max_allowed``. In each unhappy case a warning is logged so the
+    operator sees that their override didn't take effect.
+    """
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(f"Ignoring {name}={raw!r}: not an integer; using default {default}")
+        return default
+    if value <= 0:
+        logger.warning(f"Ignoring {name}={value}: must be positive; using default {default}")
+        return default
+    if value > max_allowed:
+        logger.warning(f"Ignoring {name}={value}: exceeds ceiling {max_allowed}; using default {default}")
+        return default
+    return value
+
+
 def normalize_address(raw: str) -> str:
     """Extract and normalize a bare email address for case-insensitive comparison.
 
@@ -331,6 +361,14 @@ class Settings(BaseSettings):
     _credential_storage_override: str | None = PrivateAttr(default=None)
     _loaded_keyring_references: set[tuple[str, str]] = PrivateAttr(default_factory=set)
 
+    # Homelab fork: caps for inline-attachment send. Server protection, not a
+    # deliverability guarantee — actual deliverability depends on the encoded
+    # message size after MIME wrapping. Override via
+    # MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES_PER_ITEM and
+    # MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES.
+    max_inline_attachment_bytes_per_item: int = 15 * 1024 * 1024
+    max_inline_attachment_bytes: int = 20 * 1024 * 1024
+
     model_config = SettingsConfigDict(toml_file=CONFIG_PATH, validate_assignment=True, revalidate_instances="always")
 
     @property
@@ -495,6 +533,27 @@ class Settings(BaseSettings):
             return cls()
         finally:
             _MIGRATION_LOAD = False
+
+        self._apply_homelab_overrides()
+
+    def _apply_homelab_overrides(self) -> None:
+        """Apply the homelab fork's settings overrides from environment variables.
+
+        Isolated in one method so the fork-only configuration surface stays
+        visibly separate from upstream's ``__init__`` logic (smaller merge
+        conflicts on upstream syncs).
+
+        ``_parse_positive_int_env`` returns the default unchanged when a
+        variable is unset, so unconditional reassignment is safe.
+        """
+        self.max_inline_attachment_bytes_per_item = _parse_positive_int_env(
+            "MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES_PER_ITEM",
+            self.max_inline_attachment_bytes_per_item,
+        )
+        self.max_inline_attachment_bytes = _parse_positive_int_env(
+            "MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES",
+            self.max_inline_attachment_bytes,
+        )
 
     def add_email(self, email: EmailSettings) -> None:
         """Use re-assigned for validation to work."""

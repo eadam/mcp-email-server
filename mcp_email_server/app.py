@@ -19,6 +19,7 @@ from mcp_email_server.emails.models import (
     AttachmentDownloadResponse,
     EmailContentBatchResponse,
     EmailMetadataPageResponse,
+    InlineAttachment,
     MailboxInfo,
 )
 
@@ -317,23 +318,37 @@ async def send_email(
             description="Email address to set as the Reply-To header. When set, email clients will reply to this address instead of the From address.",
         ),
     ] = None,
+    inline_attachments: Annotated[
+        list[InlineAttachment] | None,
+        Field(
+            default=None,
+            description=(
+                "Attachments shipped as inline base64 bytes — use this when the MCP client and the server "
+                "do not share a filesystem (i.e. always, for remote MCP clients). Each item is "
+                "{filename, content_base64, mime_type?}. Combined with any path-based `attachments`. "
+                "Per-item and aggregate caps configurable via MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES* envs."
+            ),
+        ),
+    ] = None,
 ) -> str:
     _enforce_recipient_allowlist(recipients, cc, bcc)
     handler = dispatch_handler(account_name)
     await handler.send_email(
-        recipients,
-        subject,
-        body,
-        cc,
-        bcc,
-        html,
-        attachments,
-        in_reply_to,
-        references,
-        reply_to,
+        recipients=recipients,
+        subject=subject,
+        body=body,
+        cc=cc,
+        bcc=bcc,
+        html=html,
+        attachments=attachments,
+        in_reply_to=in_reply_to,
+        references=references,
+        reply_to=reply_to,
+        inline_attachments=inline_attachments,
     )
     recipient_str = ", ".join(recipients)
-    attachment_info = f" with {len(attachments)} attachment(s)" if attachments else ""
+    total_attachments = len(attachments or []) + len(inline_attachments or [])
+    attachment_info = f" with {total_attachments} attachment(s)" if total_attachments else ""
     return f"Email sent successfully to {recipient_str}{attachment_info}"
 
 
@@ -395,21 +410,33 @@ async def save_to_mailbox(
             description=r"IMAP flags to set on the message. Defaults to ['\\Draft', '\\Seen']. Common flags: '\\Draft', '\\Seen', '\\Flagged'.",
         ),
     ] = None,
+    inline_attachments: Annotated[
+        list[InlineAttachment] | None,
+        Field(
+            default=None,
+            description=(
+                "Attachments shipped as inline base64 bytes — use this when the MCP client and the server "
+                "do not share a filesystem. Each item is {filename, content_base64, mime_type?}. "
+                "Combined with any path-based `attachments`."
+            ),
+        ),
+    ] = None,
 ) -> str:
     _enforce_recipient_allowlist(recipients, cc, bcc)
     handler = dispatch_handler(account_name)
     result = await handler.save_to_mailbox(
-        recipients,
-        subject,
-        body,
-        mailbox,
-        cc,
-        bcc,
-        html,
-        attachments,
-        in_reply_to,
-        references,
-        flags,
+        recipients=recipients,
+        subject=subject,
+        body=body,
+        mailbox=mailbox,
+        cc=cc,
+        bcc=bcc,
+        html=html,
+        attachments=attachments,
+        in_reply_to=in_reply_to,
+        references=references,
+        flags=flags,
+        inline_attachments=inline_attachments,
     )
     # result format: "<message-id>|uid:<imap-uid>"
     parts = result.split("|uid:")

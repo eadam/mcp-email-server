@@ -207,18 +207,20 @@ class TestClassicEmailHandler:
                 bcc=["bcc@example.com"],
             )
 
-            # Verify the client method was called correctly
+            # Verify the client method was called correctly. Kwargs spelled out
+            # explicitly so future signature additions fail loudly here too.
             mock_send.assert_called_once_with(
-                ["recipient@example.com"],
-                "Test Subject",
-                "Test Body",
-                ["cc@example.com"],
-                ["bcc@example.com"],
-                False,
-                None,
-                None,
-                None,
-                None,
+                recipients=["recipient@example.com"],
+                subject="Test Subject",
+                body="Test Body",
+                cc=["cc@example.com"],
+                bcc=["bcc@example.com"],
+                html=False,
+                attachments=None,
+                in_reply_to=None,
+                references=None,
+                reply_to=None,
+                inline_attachments=None,
             )
 
     @pytest.mark.asyncio
@@ -243,16 +245,17 @@ class TestClassicEmailHandler:
 
             # Verify the client method was called correctly with attachments
             mock_send.assert_called_once_with(
-                ["recipient@example.com"],
-                "Test Subject",
-                "Test Body with attachment",
-                None,
-                None,
-                False,
-                [str(test_file)],
-                None,
-                None,
-                None,
+                recipients=["recipient@example.com"],
+                subject="Test Subject",
+                body="Test Body with attachment",
+                cc=None,
+                bcc=None,
+                html=False,
+                attachments=[str(test_file)],
+                in_reply_to=None,
+                references=None,
+                reply_to=None,
+                inline_attachments=None,
             )
 
     @pytest.mark.asyncio
