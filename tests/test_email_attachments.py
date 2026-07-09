@@ -778,3 +778,90 @@ class TestDownloadAttachmentSenderAllowlist:
             )
         assert result["attachment_name"] == "ausflug.png"
         mock_senders.assert_not_called()
+
+
+class TestAttachmentMimeCorrectness:
+    """Regression tests for the MIME maintype/subtype fix.
+
+    Pre-fix, _create_attachment_part used MIMEApplication(_subtype=mime_type.split("/")[1])
+    which mangled every non-application type into application/<subtype>:
+    image/png shipped as application/png, text/plain as application/plain, etc.
+
+    The refactor routes through _ResolvedAttachment(maintype, subtype) and
+    builds parts with MIMEBase(maintype, subtype), so the Content-Type
+    header now reflects the real MIME type.
+    """
+
+    @staticmethod
+    def _sent_attachment_parts(mock_smtp):
+        sent_msg = mock_smtp.send_message.call_args[0][0]
+        return [p for p in sent_msg.walk() if str(p.get("Content-Disposition", "")).startswith("attachment")]
+
+    @pytest.mark.asyncio
+    async def test_png_attachment_keeps_image_maintype(self, email_client, tmp_path):
+        """An attachment with .png extension must ship as image/png, not application/png."""
+        # mimetypes only looks at the extension, so the payload need not be a real PNG.
+        png_path = tmp_path / "diagram.png"
+        png_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+
+        mock_smtp = AsyncMock()
+        mock_smtp.__aenter__ = AsyncMock(return_value=mock_smtp)
+        mock_smtp.__aexit__ = AsyncMock()
+
+        with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=mock_smtp):
+            await email_client.send_email(
+                recipients=["recipient@example.com"],
+                subject="png test",
+                body="see attached",
+                attachments=[str(png_path)],
+            )
+
+        attachment_parts = self._sent_attachment_parts(mock_smtp)
+        assert len(attachment_parts) == 1
+        # The load-bearing assertion: Content-Type stays image/png.
+        assert attachment_parts[0].get_content_type() == "image/png"
+        assert attachment_parts[0].get_filename() == "diagram.png"
+
+    @pytest.mark.asyncio
+    async def test_text_attachment_keeps_text_maintype(self, email_client, tmp_path):
+        """A .txt attachment must ship as text/plain, not application/plain."""
+        txt_path = tmp_path / "notes.txt"
+        txt_path.write_text("hello world")
+
+        mock_smtp = AsyncMock()
+        mock_smtp.__aenter__ = AsyncMock(return_value=mock_smtp)
+        mock_smtp.__aexit__ = AsyncMock()
+
+        with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=mock_smtp):
+            await email_client.send_email(
+                recipients=["recipient@example.com"],
+                subject="text test",
+                body="see attached",
+                attachments=[str(txt_path)],
+            )
+
+        attachment_parts = self._sent_attachment_parts(mock_smtp)
+        assert len(attachment_parts) == 1
+        assert attachment_parts[0].get_content_type() == "text/plain"
+
+    @pytest.mark.asyncio
+    async def test_unknown_extension_defaults_to_octet_stream(self, email_client, tmp_path):
+        """An extension with no MIME mapping falls back to application/octet-stream."""
+        weird_path = tmp_path / "blob.whatever-extension"
+        weird_path.write_bytes(b"opaque bytes")
+
+        mock_smtp = AsyncMock()
+        mock_smtp.__aenter__ = AsyncMock(return_value=mock_smtp)
+        mock_smtp.__aexit__ = AsyncMock()
+
+        with patch("mcp_email_server.emails.classic.aiosmtplib.SMTP", return_value=mock_smtp):
+            await email_client.send_email(
+                recipients=["recipient@example.com"],
+                subject="weird test",
+                body="see attached",
+                attachments=[str(weird_path)],
+            )
+
+        attachment_parts = self._sent_attachment_parts(mock_smtp)
+        assert len(attachment_parts) == 1
+        assert attachment_parts[0].get_content_type() == "application/octet-stream"
