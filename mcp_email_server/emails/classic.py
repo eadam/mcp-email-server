@@ -1017,10 +1017,19 @@ class EmailClient:
         """Raise ValueError (identical to not-found) when sender is not on the allowlist.
 
         No-op when ``allowed_senders`` is empty or None (backwards-compatible).
+
+        Only the attachment-download path uses this helper, so the block is
+        audit-logged here as a structured ``allowlist_block`` warning — the
+        tool layer intentionally cannot distinguish a blocked UID from a
+        missing one (no existence oracle), so this is the one place the block
+        is definitively known. The sender address is deliberately not logged
+        alongside the block to keep the log line content-free; the UID is
+        repr'd so CR/LF in attacker-controlled input can't forge log lines.
         """
         if allowed_senders:
             uid_senders = await self._batch_fetch_senders(imap, [email_id])
             if not sender_allowed(uid_senders.get(email_id, ""), allowed_senders):
+                logger.warning(f"allowlist_block kind=attachment_download email_id={email_id!r}")
                 msg = f"Failed to fetch email with UID {email_id}"
                 logger.error(msg)
                 raise ValueError(msg)

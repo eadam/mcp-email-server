@@ -47,7 +47,9 @@ def _enforce_recipient_allowlist(
 ) -> None:
     """Raise ValueError if any To/CC/BCC address is not in a configured allowlist.
 
-    No-op when the allowlist is empty (all recipients permitted).
+    No-op when the allowlist is empty (all recipients permitted). Every blocked
+    address is audit-logged as a structured ``allowlist_block`` warning
+    (repr'd, so CR/LF in attacker-controlled input can't forge log lines).
     """
     allowed = get_settings().allowed_recipients
     if not allowed:
@@ -56,7 +58,40 @@ def _enforce_recipient_allowlist(
     candidates = [*recipients, *(cc or []), *(bcc or [])]
     blocked = [addr for _, addr in getaddresses(candidates) if normalize_address(addr) not in allowed_set]
     if blocked:
+        for addr in blocked:
+            logger.warning(f"allowlist_block kind=recipient_send addr={addr!r}")
         raise ValueError(f"Recipient(s) not in allowlist: {', '.join(blocked)}. Allowed: {', '.join(allowed)}")
+
+
+def _enforce_required_recipient_allowlist(recipients: list[str]) -> None:
+    """Homelab hardening: fail closed when required mode is on and no recipient allowlist is set.
+
+    ``is True`` (not a truthy check) so MagicMock attributes in unit tests
+    don't accidentally trip this branch — only a real True opts in.
+    """
+    settings = get_settings()
+    if getattr(settings, "allowlist_required", False) is True and not settings.allowed_recipients:
+        logger.warning(f"allowlist_block kind=recipient_send addrs={recipients!r} reason=required-mode-empty-allowlist")
+        raise ValueError(
+            "Recipient allowlist is required (MCP_EMAIL_SERVER_ALLOWLIST_REQUIRED=true) "
+            "but allowed_recipients is empty. Configure MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS."
+        )
+
+
+def _enforce_required_sender_allowlist(kind: str) -> None:
+    """Homelab hardening: fail closed when required mode is on and no sender allowlist is set.
+
+    Applied to the read tools (kind="sender_read") and to download_attachment
+    (kind="attachment_download") before any IMAP round-trip. ``is True`` for
+    MagicMock-safety, as above.
+    """
+    settings = get_settings()
+    if getattr(settings, "allowlist_required", False) is True and not settings.allowed_senders:
+        logger.warning(f"allowlist_block kind={kind} reason=required-mode-empty-allowlist")
+        raise ValueError(
+            "Sender allowlist is required (MCP_EMAIL_SERVER_ALLOWLIST_REQUIRED=true) "
+            "but allowed_senders is empty. Configure MCP_EMAIL_SERVER_ALLOWED_SENDERS."
+        )
 
 
 class VisibilityAwareFastMCP(FastMCP):
@@ -179,6 +214,7 @@ async def list_emails_metadata(
         ),
     ] = None,
 ) -> EmailMetadataPageResponse:
+    _enforce_required_sender_allowlist("sender_read")
     handler = dispatch_handler(account_name)
 
     return await handler.get_emails_metadata(
@@ -241,6 +277,7 @@ async def get_emails_content(
         ),
     ] = 20000,
 ) -> EmailContentBatchResponse:
+    _enforce_required_sender_allowlist("sender_read")
     handler = dispatch_handler(account_name)
     return await handler.get_emails_content(email_ids, mailbox, mark_as_read, body_offset, max_body_length)
 
@@ -332,6 +369,7 @@ async def send_email(
         ),
     ] = None,
 ) -> str:
+    _enforce_required_recipient_allowlist(recipients)
     _enforce_recipient_allowlist(recipients, cc, bcc)
     handler = dispatch_handler(account_name)
     await handler.send_email(
@@ -607,6 +645,10 @@ async def download_attachment(
             "download_attachment requires save_path when inline=False. "
             "Either provide save_path or pass inline=True to receive the bytes in the response."
         )
+
+    # Fail-closed pre-check: don't even open IMAP when required mode is on but
+    # no sender allowlist is configured. Mirrors the read-tool pattern.
+    _enforce_required_sender_allowlist("attachment_download")
 
     handler = dispatch_handler(account_name)
     if inline:

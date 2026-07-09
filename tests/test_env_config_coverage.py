@@ -620,3 +620,21 @@ def test_max_inline_download_negative_falls_back(monkeypatch):
     monkeypatch.setenv("MCP_EMAIL_SERVER_MAX_INLINE_DOWNLOAD_BYTES", "-100")
     s = _reload_settings()
     assert s.max_inline_download_bytes == 20 * 1024 * 1024
+
+
+def test_allowlist_required_default_false(monkeypatch):
+    monkeypatch.delenv("MCP_EMAIL_SERVER_ALLOWLIST_REQUIRED", raising=False)
+    s = _reload_settings()
+    assert s.allowlist_required is False
+
+
+def test_allowlist_required_env_true(monkeypatch):
+    monkeypatch.setenv("MCP_EMAIL_SERVER_ALLOWLIST_REQUIRED", "true")
+    s = _reload_settings()
+    assert s.allowlist_required is True
+
+
+def test_allowlist_required_env_false_overrides(monkeypatch):
+    monkeypatch.setenv("MCP_EMAIL_SERVER_ALLOWLIST_REQUIRED", "false")
+    s = _reload_settings()
+    assert s.allowlist_required is False
