@@ -15,13 +15,19 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import mcp_email_server.config as config_module
 from mcp_email_server.config import EmailServer, EmailSettings, ProviderSettings, delete_settings
 
 
 @pytest.fixture(autouse=True)
 def patch_env(monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory):
     delete_settings()
+    # Reset the module-level settings singleton so a Settings instance cached by
+    # one test (possibly built from monkeypatched env vars) can't leak into the
+    # next test's get_settings() call.
+    config_module._settings = None
     yield
+    config_module._settings = None
 
 
 @pytest.fixture
