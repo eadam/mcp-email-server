@@ -165,6 +165,10 @@ You can also configure the email server using environment variables, which is pa
 | `MCP_EMAIL_SERVER_ALLOWED_SENDERS`            | Sender allowlist (comma-separated globs); empty = all        | -             | No       |
 | `MCP_EMAIL_SERVER_REPORT_BLOCKED_MUTATIONS`   | Report blocked mutations as failures (default: silent no-op) | `false`       | No       |
 | `MCP_EMAIL_SERVER_CREDENTIAL_STORAGE`         | Credential storage mode: `auto`, `keyring`, or `plaintext`   | `auto`        | No       |
+| `MCP_EMAIL_SERVER_ALLOWLIST_REQUIRED`         | Homelab: fail closed when the relevant allowlist is empty (see "Requiring Allowlists") | `false` | No |
+| `MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES_PER_ITEM` | Homelab: per-item raw-byte cap on inline (base64) send attachments. Server protection, not a deliverability contract. | `15728640` (15 MiB) | No |
+| `MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES` | Homelab: aggregate raw-byte cap across all `inline_attachments` on a single send. | `20971520` (20 MiB) | No |
+| `MCP_EMAIL_SERVER_MAX_INLINE_DOWNLOAD_BYTES`  | Homelab: raw-byte cap on `download_attachment(inline=True)`. See "Inline attachment caveats". | `20971520` (20 MiB) | No |
 
 ### IMAP-only mode (no SMTP)
 
@@ -247,7 +251,22 @@ enable_attachment_download = true
 # ... your email configuration
 ```
 
-Once enabled, you can use the `download_attachment` tool to save email attachments to a specified path.
+Once enabled, you can use the `download_attachment` tool to save email attachments to a specified path, or to receive them inline as base64 — see the next section.
+
+### Inline Attachments (Remote MCP Clients)
+
+Path-based attachment APIs assume the MCP client and server share a filesystem. That is rarely true in practice — remote MCP clients (Claude Desktop on a different machine, MCP server portals, network-deployed clients) can hand the server a file path that doesn't exist inside the server's namespace. To support those clients, both directions of the attachment API have an inline (base64) mode.
+
+**Sending: `inline_attachments` parameter** on `send_email` and `save_to_mailbox`. Each item is `{filename, content_base64, mime_type?}`. Filenames are sanitized server-side (path separators stripped, control chars rejected); MIME type is auto-detected from the filename if omitted. Combines with any path-based `attachments` array. Defaults: 15 MiB per item, 20 MiB aggregate — override via the two `MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES*` envs.
+
+**Receiving: `inline: bool` parameter** on `download_attachment`. When True, the response carries `content_base64` and `saved_path` is `None`; when False (the default), behavior is unchanged. Default cap 20 MiB — override via `MCP_EMAIL_SERVER_MAX_INLINE_DOWNLOAD_BYTES`.
+
+**Inline attachment caveats — please read:**
+
+- **`enable_attachment_download` is an exfiltration gate.** With inline mode available, this flag controls whether attachment bytes can leave the server at all (whether via disk or wire), not just whether they're written to disk. Be deliberate about enabling it.
+- **`save_to_mailbox` is intentionally exempt from the recipient allowlist.** Drafts are the human-review gate; the recipient allowlist only applies to `send_email`. This means an LLM can compose a draft with inline attachments addressed to anyone — that's by design, but worth knowing. (Deliberate divergence from upstream; see "Restricting Recipients" below.)
+- **Inline download caps protect the wire payload, not peak memory.** The IMAP fetch loads and parses the full message before the attachment is extracted, so an attachment that exceeds `max_inline_download_bytes` is still fetched once before being rejected. Don't rely on the cap to bound peak memory pressure under attack — set sensible IMAP-side message size limits at the provider too.
+- **Stable error messages.** Validation errors include the offending `inline_attachments[N]` index but never the base64 payload or any decoded bytes.
 
 ### Saving Sent Emails to IMAP Sent Folder
 
@@ -287,8 +306,8 @@ sent_folder_name = "INBOX.Sent"
 
 ### Restricting Recipients (Allowlist)
 
-By default the server can send to any address. Set `allowed_recipients` to restrict **both**
-`send_email` and `save_to_mailbox` to a trusted set. Leave it empty (the default) to allow all.
+By default the server can send to any address. Set `allowed_recipients` to restrict `send_email`
+to a trusted set. Leave it empty (the default) to allow all.
 
 ```toml
 allowed_recipients = ["alice@example.com", "bob@example.com"]
@@ -303,6 +322,13 @@ MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS="alice@example.com,bob@example.com"
 When configured, any To/CC/BCC address not on the list is rejected with a clear error. Matching is
 case-insensitive and understands the `Name <addr@example.com>` form. The `list_allowed_recipients`
 tool appears only when an allowlist is configured, so default installs keep a minimal tool surface.
+
+**Drafts exemption (divergence from upstream):** `save_to_mailbox` is intentionally NOT subject to
+the recipient allowlist — in any mode, including fail-closed required mode. Saving a draft
+transmits nothing; the human reviewing the Drafts folder is the gate, and this keeps the
+compose-review-send workflow working for new contacts. Upstream `ai-zerolab/mcp-email-server`
+enforces the allowlist on `save_to_mailbox` as well — this fork deliberately does not, and
+`tests/test_allowlist_hardening.py::TestSaveToMailboxNotAllowlisted` guards the divergence.
 
 ### Filtering Incoming Mail (Sender Allowlist)
 
@@ -341,6 +367,22 @@ a missing one).
 **Note:** matching is against the message's `From` header — local filtering only, not sender
 authentication. A spoofed `From` will pass the allowlist, so this is not a substitute for provider-side
 SPF / DKIM / DMARC enforcement.
+
+### Requiring Allowlists (Fail-Closed Mode)
+
+By default an empty allowlist means "allow all". Set `MCP_EMAIL_SERVER_ALLOWLIST_REQUIRED=true`
+(or `allowlist_required = true` in TOML) to flip that to "deny all with an actionable error":
+
+- `send_email` refuses to send when `allowed_recipients` is empty.
+- `list_emails_metadata`, `get_emails_content`, and `download_attachment` refuse to operate when
+  `allowed_senders` is empty — before any IMAP round-trip.
+
+Use this in deployments where the allowlists are part of the security posture: a config regression
+that accidentally clears an allowlist then fails loudly instead of silently opening the server up.
+`save_to_mailbox` is unaffected (see the drafts exemption above), as are the mutation tools.
+
+Every allowlist block — fail-closed or per-address — is also audit-logged as a structured
+`allowlist_block kind=... ...` warning, greppable from container logs.
 
 ### Self-Signed Certificates and IMAP STARTTLS (e.g., ProtonMail Bridge)
 
