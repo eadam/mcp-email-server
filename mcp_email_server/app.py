@@ -284,8 +284,9 @@ async def get_emails_content(
 
 @mcp.tool(
     description=(
-        "List the configured recipient allowlist — the addresses that send_email is permitted to "
-        "send to and save_to_mailbox is permitted to address. Only available when an allowlist is configured."
+        "List the configured outbound recipient allowlist — the addresses that send_email is "
+        "permitted to send to. save_to_mailbox is intentionally exempt (drafts are the human-review "
+        "gate; nothing is transmitted). Only available when an allowlist is configured."
     ),
     visible_if=_has_allowed_recipients,
 )
@@ -395,7 +396,9 @@ async def send_email(
     description="Compose an email and save it to an IMAP folder (e.g., Drafts). "
     "Same parameters as send_email, but saves instead of sending. "
     "Default folder is Drafts with \\Draft and \\Seen flags. "
-    "Pure IMAP operation — works without SMTP configuration.",
+    "Pure IMAP operation — works without SMTP configuration. "
+    "Unlike send_email, recipients are NOT checked against the recipient allowlist: "
+    "nothing is transmitted, and drafts are the human-review gate.",
 )
 async def save_to_mailbox(
     account_name: Annotated[str, Field(description="The name of the email account.")],
@@ -461,7 +464,11 @@ async def save_to_mailbox(
         ),
     ] = None,
 ) -> str:
-    _enforce_recipient_allowlist(recipients, cc, bcc)
+    # Homelab divergence from upstream: save_to_mailbox deliberately does NOT
+    # call _enforce_recipient_allowlist (in any mode, including
+    # allowlist_required). Saving a draft transmits nothing — the human
+    # reviewing the Drafts folder is the gate, and gating drafts would only
+    # block the compose-review-send workflow for new contacts.
     handler = dispatch_handler(account_name)
     result = await handler.save_to_mailbox(
         recipients=recipients,
