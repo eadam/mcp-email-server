@@ -312,6 +312,14 @@ class Settings(BaseSettings):
     allowed_senders: list[str] = []
     report_blocked_mutations: bool = False
 
+    # Homelab fork: when True, an empty allowlist means "deny all" (fail-closed)
+    # rather than "allow all" (the upstream default). send_email honors this for
+    # allowed_recipients; list_emails_metadata / get_emails_content /
+    # download_attachment honor it for allowed_senders. save_to_mailbox is
+    # intentionally NOT subject to the recipient allowlist in any mode (drafts
+    # are the human-review gate). Default False preserves upstream behavior.
+    allowlist_required: bool = False
+
     # Homelab fork: caps for inline-attachment send. Server protection, not a
     # deliverability guarantee — actual deliverability depends on the encoded
     # message size after MIME wrapping. Override via
@@ -392,6 +400,8 @@ class Settings(BaseSettings):
         ``_parse_positive_int_env`` returns the default unchanged when a
         variable is unset, so unconditional reassignment is safe.
         """
+        self._apply_bool_env_override("allowlist_required", "MCP_EMAIL_SERVER_ALLOWLIST_REQUIRED")
+
         self.max_inline_attachment_bytes_per_item = _parse_positive_int_env(
             "MCP_EMAIL_SERVER_MAX_INLINE_ATTACHMENT_BYTES_PER_ITEM",
             self.max_inline_attachment_bytes_per_item,
