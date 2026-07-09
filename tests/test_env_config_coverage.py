@@ -2,8 +2,6 @@
 
 import os
 
-import pytest
-
 from mcp_email_server.config import EmailSettings, Settings
 
 
@@ -424,11 +422,7 @@ def test_allowed_recipients_from_env(tmp_path, monkeypatch):
     blank.write_text("")
     monkeypatch.setitem(Settings.model_config, "toml_file", blank)
     monkeypatch.setenv("MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS", "alice@example.com, BOB@EXAMPLE.COM , alice@example.com")
-    config_module._settings = None
-    try:
-        assert config_module.get_settings(reload=True).allowed_recipients == ["alice@example.com", "bob@example.com"]
-    finally:
-        config_module._settings = None
+    assert config_module.get_settings(reload=True).allowed_recipients == ["alice@example.com", "bob@example.com"]
 
 
 def test_allowed_recipients_env_empty_string_keeps_empty(tmp_path, monkeypatch):
@@ -439,11 +433,7 @@ def test_allowed_recipients_env_empty_string_keeps_empty(tmp_path, monkeypatch):
     blank.write_text("")
     monkeypatch.setitem(Settings.model_config, "toml_file", blank)
     monkeypatch.setenv("MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS", "")
-    config_module._settings = None
-    try:
-        assert config_module.get_settings(reload=True).allowed_recipients == []
-    finally:
-        config_module._settings = None
+    assert config_module.get_settings(reload=True).allowed_recipients == []
 
 
 def test_allowed_recipients_env_overrides_toml(tmp_path, monkeypatch):
@@ -456,11 +446,7 @@ def test_allowed_recipients_env_overrides_toml(tmp_path, monkeypatch):
     cfg.write_bytes(tomli_w.dumps({"allowed_recipients": ["fromtoml@example.com"]}).encode())
     monkeypatch.setitem(Settings.model_config, "toml_file", cfg)
     monkeypatch.setenv("MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS", "fromenv@example.com")
-    config_module._settings = None
-    try:
-        assert config_module.get_settings(reload=True).allowed_recipients == ["fromenv@example.com"]
-    finally:
-        config_module._settings = None
+    assert config_module.get_settings(reload=True).allowed_recipients == ["fromenv@example.com"]
 
 
 def test_allowed_recipients_empty_env_overrides_toml(tmp_path, monkeypatch):
@@ -473,11 +459,7 @@ def test_allowed_recipients_empty_env_overrides_toml(tmp_path, monkeypatch):
     cfg.write_bytes(tomli_w.dumps({"allowed_recipients": ["fromtoml@example.com"]}).encode())
     monkeypatch.setitem(Settings.model_config, "toml_file", cfg)
     monkeypatch.setenv("MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS", "")
-    config_module._settings = None
-    try:
-        assert config_module.get_settings(reload=True).allowed_recipients == []
-    finally:
-        config_module._settings = None
+    assert config_module.get_settings(reload=True).allowed_recipients == []
 
 
 def test_allowed_senders_from_env(tmp_path, monkeypatch):
@@ -488,11 +470,7 @@ def test_allowed_senders_from_env(tmp_path, monkeypatch):
     blank.write_text("")
     monkeypatch.setitem(Settings.model_config, "toml_file", blank)
     monkeypatch.setenv("MCP_EMAIL_SERVER_ALLOWED_SENDERS", "*@Example.com, BOB@EXAMPLE.COM , *@example.com")
-    config_module._settings = None
-    try:
-        assert config_module.get_settings(reload=True).allowed_senders == ["*@example.com", "bob@example.com"]
-    finally:
-        config_module._settings = None
+    assert config_module.get_settings(reload=True).allowed_senders == ["*@example.com", "bob@example.com"]
 
 
 def test_allowed_senders_env_overrides_toml(tmp_path, monkeypatch):
@@ -505,11 +483,7 @@ def test_allowed_senders_env_overrides_toml(tmp_path, monkeypatch):
     cfg.write_bytes(tomli_w.dumps({"allowed_senders": ["fromtoml@example.com"]}).encode())
     monkeypatch.setitem(Settings.model_config, "toml_file", cfg)
     monkeypatch.setenv("MCP_EMAIL_SERVER_ALLOWED_SENDERS", "*@env.com")
-    config_module._settings = None
-    try:
-        assert config_module.get_settings(reload=True).allowed_senders == ["*@env.com"]
-    finally:
-        config_module._settings = None
+    assert config_module.get_settings(reload=True).allowed_senders == ["*@env.com"]
 
 
 def test_allowed_senders_empty_env_clears_toml(tmp_path, monkeypatch):
@@ -522,24 +496,10 @@ def test_allowed_senders_empty_env_clears_toml(tmp_path, monkeypatch):
     cfg.write_bytes(tomli_w.dumps({"allowed_senders": ["*@example.com"]}).encode())
     monkeypatch.setitem(Settings.model_config, "toml_file", cfg)
     monkeypatch.setenv("MCP_EMAIL_SERVER_ALLOWED_SENDERS", "")
-    config_module._settings = None
-    try:
-        assert config_module.get_settings(reload=True).allowed_senders == []
-    finally:
-        config_module._settings = None
+    assert config_module.get_settings(reload=True).allowed_senders == []
 
 
 # ---- Inline-attachment cap env parsing (homelab fork) ----
-
-
-@pytest.fixture(autouse=True)
-def _reset_settings_cache():
-    """Keep the settings singleton from leaking monkeypatched caps between tests."""
-    import mcp_email_server.config as config_module
-
-    config_module._settings = None
-    yield
-    config_module._settings = None
 
 
 def _reload_settings():
