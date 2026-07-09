@@ -919,15 +919,22 @@ class TestMcpTools:
         mock_handler.send_email.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_save_to_mailbox_blocks_unlisted_recipient(self):
+    async def test_save_to_mailbox_allows_unlisted_recipient(self):
+        # Homelab divergence from upstream (which blocks here): save_to_mailbox
+        # is deliberately exempt from the recipient allowlist — drafts transmit
+        # nothing and are the human-review gate. See TestSaveToMailboxNotAllowlisted
+        # in tests/test_allowlist_hardening.py for the full regression guard.
         mock_settings = MagicMock()
         mock_settings.allowed_recipients = ["alice@example.com"]
         mock_handler = AsyncMock()
+        mock_handler.save_to_mailbox.return_value = "<mid@example.com>|uid:42"
         with patch("mcp_email_server.app.get_settings", return_value=mock_settings):
             with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
-                with pytest.raises(ValueError, match="not in allowlist"):
-                    await save_to_mailbox(account_name="test", recipients=["mallory@evil.com"], subject="S", body="B")
-        mock_handler.save_to_mailbox.assert_not_called()
+                result = await save_to_mailbox(
+                    account_name="test", recipients=["mallory@evil.com"], subject="S", body="B"
+                )
+        mock_handler.save_to_mailbox.assert_called_once()
+        assert "saved" in result.lower()
 
     @pytest.mark.asyncio
     async def test_save_to_mailbox_allows_listed_recipient(self):
@@ -960,20 +967,23 @@ class TestMcpTools:
         mock_handler.send_email.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_save_to_mailbox_blocks_packed_multi_address_recipient(self):
+    async def test_save_to_mailbox_allows_packed_multi_address_recipient(self):
+        # Homelab divergence from upstream (which blocks here): the drafts
+        # exemption applies regardless of how the recipient list is packed.
         mock_settings = MagicMock()
         mock_settings.allowed_recipients = ["alice@example.com"]
         mock_handler = AsyncMock()
+        mock_handler.save_to_mailbox.return_value = "<mid@example.com>|uid:42"
         with patch("mcp_email_server.app.get_settings", return_value=mock_settings):
             with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
-                with pytest.raises(ValueError, match=r"mallory@evil\.com"):
-                    await save_to_mailbox(
-                        account_name="test",
-                        recipients=["alice@example.com, mallory@evil.com"],
-                        subject="S",
-                        body="B",
-                    )
-        mock_handler.save_to_mailbox.assert_not_called()
+                result = await save_to_mailbox(
+                    account_name="test",
+                    recipients=["alice@example.com, mallory@evil.com"],
+                    subject="S",
+                    body="B",
+                )
+        mock_handler.save_to_mailbox.assert_called_once()
+        assert "saved" in result.lower()
 
     @pytest.mark.asyncio
     async def test_list_allowed_senders_hidden_when_unconfigured(self):
