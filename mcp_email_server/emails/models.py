@@ -85,10 +85,19 @@ class MailboxInfo(BaseModel):
 
 
 class AttachmentDownloadResponse(BaseModel):
-    """Attachment download response"""
+    """Attachment download response.
+
+    ``saved_path`` is populated when ``download_attachment`` is invoked with
+    ``inline=False`` (the default, disk-write behavior). ``content_base64``
+    is populated when ``inline=True`` — the attachment bytes are returned
+    over the MCP wire instead of being written to disk, so remote clients
+    that cannot read the server's filesystem can still receive attachments.
+    Exactly one of the two is populated per call.
+    """
 
     email_id: str
     attachment_name: str
     mime_type: str
     size: int
-    saved_path: str
+    saved_path: str | None = None
+    content_base64: str | None = None

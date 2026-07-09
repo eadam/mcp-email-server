@@ -197,3 +197,31 @@ class EmailHandler(abc.ABC):
         Returns:
             AttachmentDownloadResponse with download result information.
         """
+
+    @abc.abstractmethod
+    async def download_attachment_inline(
+        self,
+        email_id: str,
+        attachment_name: str,
+        mailbox: str = "INBOX",
+        *,
+        max_bytes: int,
+    ) -> "AttachmentDownloadResponse":
+        """
+        Download an email attachment as inline base64 bytes — no disk write.
+
+        Symmetric to :py:meth:`download_attachment`, but the response carries
+        ``content_base64`` instead of ``saved_path``. For remote MCP clients
+        that cannot read the server's filesystem.
+
+        Args:
+            email_id: The UID of the email containing the attachment.
+            attachment_name: The filename of the attachment to download.
+            mailbox: The mailbox to search in (default: "INBOX").
+            max_bytes: Per-call inline-size cap. Exceeding it raises
+                ``ValueError`` with a stable message.
+
+        Returns:
+            AttachmentDownloadResponse with ``content_base64`` populated and
+            ``saved_path`` left None.
+        """
