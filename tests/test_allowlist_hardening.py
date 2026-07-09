@@ -5,9 +5,11 @@ forms (see test_mcp_tools.py) — those cases are intentionally not duplicated
 here. This module covers the fork-only behaviors:
 
 - Fail-closed required mode via MCP_EMAIL_SERVER_ALLOWLIST_REQUIRED: when True
-  and the relevant allowlist is empty, send_email (recipients) and
-  list_emails_metadata / get_emails_content / download_attachment (senders)
-  refuse to operate instead of allowing everything.
+  and the relevant allowlist is empty, send_email (recipients), the read tools
+  list_emails_metadata / get_emails_content / download_attachment (senders),
+  and the mutation tools delete_emails / mark_emails_as_read / move_emails /
+  archive_emails (senders — the allowlist scopes which messages mutations may
+  touch) refuse to operate instead of allowing everything.
 - Structured ``allowlist_block`` logger.warning emission on blocks, greppable
   from container logs.
 - The drafts exemption: save_to_mailbox never consults the recipient
@@ -19,9 +21,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from mcp_email_server.app import (
+    archive_emails,
+    delete_emails,
     download_attachment,
     get_emails_content,
     list_emails_metadata,
+    mark_emails_as_read,
+    move_emails,
     save_to_mailbox,
     send_email,
 )
@@ -193,6 +199,28 @@ class TestStructuredLogging:
         assert block_calls
         assert any("kind=attachment_download" in str(c) for c in block_calls)
 
+    @pytest.mark.asyncio
+    async def test_required_mode_send_block_logs_cc_and_bcc(self):
+        """The required-mode audit line covers the full recipient set, not just To."""
+        with patch("mcp_email_server.app.get_settings", return_value=_required_mode_settings()):
+            with patch("mcp_email_server.app.logger.warning") as mock_warn:
+                with pytest.raises(ValueError):
+                    await send_email(
+                        account_name="test",
+                        recipients=["to@example.com"],
+                        subject="hi",
+                        body="x",
+                        cc=["cc@example.com"],
+                        bcc=["bcc@example.com"],
+                    )
+
+        block_calls = [c for c in mock_warn.call_args_list if "allowlist_block" in str(c)]
+        assert block_calls
+        logged = " ".join(str(c) for c in block_calls)
+        assert "to@example.com" in logged
+        assert "cc@example.com" in logged
+        assert "bcc@example.com" in logged
+
 
 class TestSaveToMailboxNotAllowlisted:
     """Regression guard: save_to_mailbox MUST NOT check the recipient allowlist.
@@ -243,3 +271,65 @@ class TestSaveToMailboxNotAllowlisted:
 
         assert "saved to 'Drafts' successfully" in result
         mock_handler.save_to_mailbox.assert_called_once()
+
+
+class TestRequiredModeMutations:
+    """Required mode with an empty sender allowlist must also stop mutations.
+
+    The sender allowlist is what scopes which messages the mutation tools may
+    touch; if reads fail closed but delete/mark/move/archive still ran, the
+    most destructive tools would be the only unrestricted ones.
+    """
+
+    @pytest.mark.asyncio
+    async def test_delete_emails_blocks_when_required_and_senders_unset(self):
+        with patch("mcp_email_server.app.get_settings", return_value=_required_mode_settings()):
+            with patch("mcp_email_server.app.dispatch_handler") as mock_dispatch:
+                with pytest.raises(ValueError, match="Sender allowlist is required"):
+                    await delete_emails(account_name="test", email_ids=["1"])
+                mock_dispatch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mark_emails_as_read_blocks_when_required_and_senders_unset(self):
+        with patch("mcp_email_server.app.get_settings", return_value=_required_mode_settings()):
+            with patch("mcp_email_server.app.dispatch_handler") as mock_dispatch:
+                with pytest.raises(ValueError, match="Sender allowlist is required"):
+                    await mark_emails_as_read(account_name="test", email_ids=["1"])
+                mock_dispatch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_move_emails_blocks_when_required_and_senders_unset(self):
+        with patch("mcp_email_server.app.get_settings", return_value=_required_mode_settings()):
+            with patch("mcp_email_server.app.dispatch_handler") as mock_dispatch:
+                with pytest.raises(ValueError, match="Sender allowlist is required"):
+                    await move_emails(account_name="test", email_ids=["1"], destination_mailbox="Archive")
+                mock_dispatch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_archive_emails_blocks_when_required_and_senders_unset(self):
+        with patch("mcp_email_server.app.get_settings", return_value=_required_mode_settings()):
+            with patch("mcp_email_server.app.dispatch_handler") as mock_dispatch:
+                with pytest.raises(ValueError, match="Sender allowlist is required"):
+                    await archive_emails(account_name="test", email_ids=["1"])
+                mock_dispatch.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_mutation_block_logs_sender_mutation_kind(self):
+        with patch("mcp_email_server.app.get_settings", return_value=_required_mode_settings()):
+            with patch("mcp_email_server.app.logger.warning") as mock_warn:
+                with pytest.raises(ValueError):
+                    await delete_emails(account_name="test", email_ids=["1"])
+        block_calls = [c for c in mock_warn.call_args_list if "allowlist_block" in str(c)]
+        assert block_calls
+        assert any("kind=sender_mutation" in str(c) for c in block_calls)
+
+    @pytest.mark.asyncio
+    async def test_mutations_proceed_when_required_and_senders_configured(self):
+        mock_settings = _required_mode_settings(allowed_senders=["*@example.com"])
+        mock_handler = AsyncMock()
+        mock_handler.delete_emails.return_value = (["1"], [])
+        with patch("mcp_email_server.app.get_settings", return_value=mock_settings):
+            with patch("mcp_email_server.app.dispatch_handler", return_value=mock_handler):
+                result = await delete_emails(account_name="test", email_ids=["1"])
+        assert "Successfully deleted 1 email(s)" in result
+        mock_handler.delete_emails.assert_called_once()

@@ -63,7 +63,11 @@ def _enforce_recipient_allowlist(
         raise ValueError(f"Recipient(s) not in allowlist: {', '.join(blocked)}. Allowed: {', '.join(allowed)}")
 
 
-def _enforce_required_recipient_allowlist(recipients: list[str]) -> None:
+def _enforce_required_recipient_allowlist(
+    recipients: list[str],
+    cc: list[str] | None,
+    bcc: list[str] | None,
+) -> None:
     """Homelab hardening: fail closed when required mode is on and no recipient allowlist is set.
 
     ``is True`` (not a truthy check) so MagicMock attributes in unit tests
@@ -71,7 +75,8 @@ def _enforce_required_recipient_allowlist(recipients: list[str]) -> None:
     """
     settings = get_settings()
     if getattr(settings, "allowlist_required", False) is True and not settings.allowed_recipients:
-        logger.warning(f"allowlist_block kind=recipient_send addrs={recipients!r} reason=required-mode-empty-allowlist")
+        all_addrs = [*recipients, *(cc or []), *(bcc or [])]
+        logger.warning(f"allowlist_block kind=recipient_send addrs={all_addrs!r} reason=required-mode-empty-allowlist")
         raise ValueError(
             "Recipient allowlist is required (MCP_EMAIL_SERVER_ALLOWLIST_REQUIRED=true) "
             "but allowed_recipients is empty. Configure MCP_EMAIL_SERVER_ALLOWED_RECIPIENTS."
@@ -81,9 +86,12 @@ def _enforce_required_recipient_allowlist(recipients: list[str]) -> None:
 def _enforce_required_sender_allowlist(kind: str) -> None:
     """Homelab hardening: fail closed when required mode is on and no sender allowlist is set.
 
-    Applied to the read tools (kind="sender_read") and to download_attachment
-    (kind="attachment_download") before any IMAP round-trip. ``is True`` for
-    MagicMock-safety, as above.
+    Applied before any IMAP round-trip to the read tools (kind="sender_read"),
+    to download_attachment (kind="attachment_download"), and to the mutation
+    tools delete/mark-as-read/move/archive (kind="sender_mutation") — the
+    sender allowlist is what scopes which messages mutations may touch, so an
+    empty list in required mode must not leave mutations unrestricted. ``is
+    True`` for MagicMock-safety, as above.
     """
     settings = get_settings()
     if getattr(settings, "allowlist_required", False) is True and not settings.allowed_senders:
@@ -370,7 +378,7 @@ async def send_email(
         ),
     ] = None,
 ) -> str:
-    _enforce_required_recipient_allowlist(recipients)
+    _enforce_required_recipient_allowlist(recipients, cc, bcc)
     _enforce_recipient_allowlist(recipients, cc, bcc)
     handler = dispatch_handler(account_name)
     await handler.send_email(
@@ -502,6 +510,7 @@ async def delete_emails(
     ],
     mailbox: Annotated[str, Field(default="INBOX", description="The mailbox to delete emails from.")] = "INBOX",
 ) -> str:
+    _enforce_required_sender_allowlist("sender_mutation")
     handler = dispatch_handler(account_name)
     deleted_ids, failed_ids = await handler.delete_emails(email_ids, mailbox)
 
@@ -522,6 +531,7 @@ async def mark_emails_as_read(
     ],
     mailbox: Annotated[str, Field(default="INBOX", description="The mailbox containing the emails.")] = "INBOX",
 ) -> str:
+    _enforce_required_sender_allowlist("sender_mutation")
     handler = dispatch_handler(account_name)
     marked_ids, failed_ids = await handler.mark_emails_as_read(email_ids, mailbox)
 
@@ -545,6 +555,7 @@ async def move_emails(
         str, Field(default="INBOX", description="The source mailbox containing the emails.")
     ] = "INBOX",
 ) -> str:
+    _enforce_required_sender_allowlist("sender_mutation")
     handler = dispatch_handler(account_name)
     moved_ids, failed_ids = await handler.move_emails(email_ids, source_mailbox, destination_mailbox)
 
@@ -567,6 +578,7 @@ async def archive_emails(
     ],
     mailbox: Annotated[str, Field(default="INBOX", description="The source mailbox containing the emails.")] = "INBOX",
 ) -> str:
+    _enforce_required_sender_allowlist("sender_mutation")
     handler = dispatch_handler(account_name)
     archived_ids, failed_ids, archive_folder = await handler.archive_emails(email_ids, mailbox)
 

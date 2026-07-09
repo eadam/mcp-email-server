@@ -376,10 +376,14 @@ By default an empty allowlist means "allow all". Set `MCP_EMAIL_SERVER_ALLOWLIST
 - `send_email` refuses to send when `allowed_recipients` is empty.
 - `list_emails_metadata`, `get_emails_content`, and `download_attachment` refuse to operate when
   `allowed_senders` is empty — before any IMAP round-trip.
+- The mutation tools (`delete_emails`, `mark_emails_as_read`, `move_emails`, `archive_emails`)
+  also refuse when `allowed_senders` is empty: the sender allowlist is what scopes which messages
+  mutations may touch, so an empty list in required mode must not leave them unrestricted.
 
 Use this in deployments where the allowlists are part of the security posture: a config regression
 that accidentally clears an allowlist then fails loudly instead of silently opening the server up.
-`save_to_mailbox` is unaffected (see the drafts exemption above), as are the mutation tools.
+`save_to_mailbox` is the only compose/mutation surface exempt in required mode (see the drafts
+exemption above).
 
 Every allowlist block — fail-closed or per-address — is also audit-logged as a structured
 `allowlist_block kind=... ...` warning, greppable from container logs.
