@@ -1168,11 +1168,13 @@ class TestInlineSendAttachments:
         from mcp_email_server.emails.classic import ClassicEmailHandler
 
         # We don't run the IMAP APPEND — just verify the compose call shape.
+        # save_to_mailbox composes/appends via the IMAP incoming_client
+        # (upstream #194: drafts work without SMTP configured).
         handler = ClassicEmailHandler.__new__(ClassicEmailHandler)
-        handler.outgoing_client = MagicMock()
-        handler.outgoing_client.compose_message = MagicMock(return_value=MIMEMultipartSentinel())
+        handler.incoming_client = MagicMock()
+        handler.incoming_client.compose_message = MagicMock(return_value=MIMEMultipartSentinel())
         handler.email_settings = MagicMock()
-        handler.outgoing_client.append_to_mailbox = AsyncMock(return_value="42")
+        handler.incoming_client.append_to_mailbox = AsyncMock(return_value="42")
 
         attachment = _inline(b"x", "draft.txt")
         await handler.save_to_mailbox(
@@ -1181,7 +1183,7 @@ class TestInlineSendAttachments:
             body="b",
             inline_attachments=[attachment],
         )
-        kwargs = handler.outgoing_client.compose_message.call_args.kwargs
+        kwargs = handler.incoming_client.compose_message.call_args.kwargs
         assert kwargs["inline_attachments"] == [attachment]
         assert kwargs["include_bcc_header"] is True
 

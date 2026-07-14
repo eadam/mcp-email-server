@@ -428,6 +428,7 @@ class Settings(BaseSettings):
 
         if not migration_load:
             self._apply_env_overrides()
+            self._apply_homelab_overrides()
 
         # Preserve which entries were keyring references before replacing their
         # sentinels with live secrets. Plaintext migration uses this provenance to
@@ -549,8 +550,6 @@ class Settings(BaseSettings):
             return cls()
         finally:
             _MIGRATION_LOAD = False
-
-        self._apply_homelab_overrides()
 
     def _apply_homelab_overrides(self) -> None:
         """Apply the homelab fork's settings overrides from environment variables.
