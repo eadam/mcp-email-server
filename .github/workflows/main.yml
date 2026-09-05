@@ -4,7 +4,14 @@ on:
   push:
     branches:
       - main
-      - homelab-v2
+      # Glob, not an enumerated list. The carry set is re-founded onto a new
+      # upstream base every so often and lands on a fresh `homelab-vN` branch;
+      # each time, this trigger was rebased forward verbatim and kept naming
+      # the PREVIOUS branch. That left homelab-v3 -- the branch production is
+      # actually built from -- with zero CI runs for seven weeks while the
+      # weekly report kept reporting green CI for homelab-v2, which nothing
+      # deploys. A glob makes the next re-founding inherit CI automatically.
+      - homelab-v*
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
 
