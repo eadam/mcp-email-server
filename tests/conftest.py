@@ -26,8 +26,8 @@ from keyring.backend import KeyringBackend
 from keyring.backends.fail import Keyring as FailKeyring
 from keyring.errors import PasswordDeleteError
 
-from mcp_email_server import keyring_store
 import mcp_email_server.config as config_module
+from mcp_email_server import keyring_store
 from mcp_email_server.config import EmailServer, EmailSettings, ProviderSettings, delete_settings
 
 
