@@ -229,6 +229,41 @@ def _quote_mailbox(mailbox: str) -> str:
     return f'"{escaped}"'
 
 
+_SEARCH_COMPLETION_ONLY = re.compile(rb"SEARCH\s+completed\b.*", re.IGNORECASE)
+_UID_TOKEN = re.compile(rb"[1-9][0-9]*")
+
+
+def _normalize_search_uids(messages: Any) -> list[bytes]:
+    """Return the UID tokens from one aioimaplib UID SEARCH payload.
+
+    iCloud omits the untagged ``* SEARCH`` line when a search matches nothing.
+    aioimaplib then leaves only the tagged completion text as the first
+    response element, so a plain emptiness check still passes and the
+    completion words get split into pseudo-UIDs — ``int("SEARCH")`` raises and
+    the whole tool call fails on what is really an empty result set.
+
+    Recognize only that one observed completion-only shape as empty. Any other
+    non-UID payload stays an error, so a genuine provider change is not
+    silently swallowed as "no results".
+    """
+    if not messages or not messages[0]:
+        return []
+
+    payload = messages[0]
+    if isinstance(payload, str):
+        payload = payload.encode("utf-8", errors="replace")
+    payload = payload.strip()
+
+    if _SEARCH_COMPLETION_ONLY.fullmatch(payload):
+        logger.debug("Provider omitted the empty UID SEARCH payload; treating the search as empty")
+        return []
+
+    uids = payload.split()
+    if any(_UID_TOKEN.fullmatch(uid) is None for uid in uids):
+        raise ValueError(f"Unexpected UID SEARCH payload from provider: {payload[:120]!r}")
+    return uids
+
+
 def _uid_sort_key(uid: bytes | str) -> int:
     """Return a numeric sort key for IMAP UIDs."""
     value = uid.decode() if isinstance(uid, bytes) else uid
@@ -1102,12 +1137,13 @@ class EmailClient:
             charset = "utf-8" if any(value and not value.isascii() for value in search_text_values) else None
             _, messages = await imap.uid_search(*search_criteria, charset=charset)
 
-            # Handle empty or None responses
-            if not messages or not messages[0]:
-                logger.warning("No messages returned from search")
+            # Handle empty or None responses, including the completion-only
+            # payload some providers send for a zero-match search.
+            email_ids = _normalize_search_uids(messages)
+            if not email_ids:
+                logger.info("No messages matched the search")
                 return 0, []
 
-            email_ids = messages[0].split()
             logger.info(f"Found {len(email_ids)} email IDs")
 
             # Sender allowlist: filter candidates BEFORE sorting/pagination so total + pages stay honest.
