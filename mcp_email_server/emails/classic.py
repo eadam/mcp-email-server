@@ -185,11 +185,27 @@ def _read_imap_list_token(value: str, start: int) -> tuple[str | None, int]:
     return _read_atom_imap_token(value, index)
 
 
+# Some providers hand the tagged completion text back as a data item in the
+# LIST response instead of keeping it out of band. Verbatim capture from
+# imap.mail.me.com: b"LIST completed (took 2 ms)". Read as a mailbox line it
+# parses to delimiter "LIST", name "completed" -- the phantom extra mailbox.
+_LIST_COMPLETION_ONLY = re.compile(r"(?:LIST|LSUB|XLIST)\s+completed\b.*", re.IGNORECASE)
+
+
 def _parse_list_response(item: bytes | str) -> MailboxInfo | None:
-    """Parse one IMAP LIST response into a MailboxInfo object."""
+    """Parse one IMAP LIST response into a MailboxInfo object.
+
+    Returns None for anything that is not a mailbox line, so a provider that
+    mixes its completion text into the data items does not produce a phantom
+    mailbox.
+    """
     item_str = item.decode("utf-8", errors="replace") if isinstance(item, bytes) else str(item)
     item_str = item_str.strip()
     if not item_str:
+        return None
+
+    if _LIST_COMPLETION_ONLY.fullmatch(item_str):
+        logger.debug(f"Ignoring LIST completion line in mailbox data: {item_str!r}")
         return None
 
     flags: list[str] = []
@@ -204,6 +220,14 @@ def _parse_list_response(item: bytes | str) -> MailboxInfo | None:
         return None
 
     delimiter = "" if delimiter_token.upper() == "NIL" else delimiter_token
+    # RFC 3501 mailbox-list: the hierarchy delimiter is NIL or ONE quoted
+    # character. A longer token means this is not a mailbox line, so refuse to
+    # invent an entry rather than returning a plausible-looking one. This is the
+    # general backstop behind the completion-line check above -- any
+    # "<WORD> completed ..." line fails here even if the wording changes.
+    if len(delimiter) > 1:
+        logger.warning(f"Ignoring unparseable IMAP LIST response: {item_str!r}")
+        return None
     return MailboxInfo(name=decode_mailbox_name(mailbox_token), delimiter=delimiter, flags=flags)
 
 
